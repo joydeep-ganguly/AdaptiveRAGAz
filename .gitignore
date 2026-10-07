@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Environment / secrets
+.env
+!.env.example
+
+# SQLite runtime files (recreated locally; the .db files themselves are LFS-tracked, not ignored)
+*.db-shm
+*.db-wal
+
+# Backend runtime output — regenerated at runtime, not source
+backend/storage/debug_logs/
+backend/storage/media/
+
+# IDE
+.vscode/
+.idea/
+# Runtime databases: user accounts and chat history
+backend/storage/sqlite/app.db
+backend/storage/sqlite/checkpoints.db

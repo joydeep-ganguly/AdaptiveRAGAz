@@ -1,0 +1,4 @@
+-r backend.txt
+pytest
+pytest-mock
+pytest-cov
