@@ -7,10 +7,10 @@ build order, then the gotchas worth knowing before you start.
 
 ---
 
-## 0. What I found while reading the current code
+## 0. Findings from the current code
 
 - `backend/data/` currently mixes two unrelated purposes: `amazon/`, `apple/`, `google/`
-  (PDF filings, confirmed via the filesystem — e.g. `amazon/amazon 10-k 2024.pdf`) sit
+  (PDF filings, e.g. `amazon/amazon 10-k 2024.pdf`) sit
   alongside `IMDB-Movie-Data.csv`, `titanic.csv`, `apple_2024.xlsx`, `google_2024.xlsx`
   (the code-execution agent's analysis datasets).
 - The RAG side has **no ingestion code in the backend at all yet** — `chroma_financial_db/`

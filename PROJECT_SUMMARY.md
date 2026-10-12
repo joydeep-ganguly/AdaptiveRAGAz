@@ -77,7 +77,7 @@ AdaptiveRAG/
 ├── AdaptiveRAG_Implementation_Plan.md      original plan (kept intact)
 ├── AdaptiveRAG_Agent_Wiring_Addendum.md    agent/ import-wiring addendum
 ├── AdaptiveRAG_Phase2_Plan.md              admin roles, data split, uploads
-├── thread_summary.md                       this file
+├── PROJECT_SUMMARY.md                      this file
 ├── AdaptiveRAG_Azure_SubPlan1_CodeData_Blob.md   Azure Sub-Plan 1 (code data to Blob): design, steps, progress log
 ├── AdaptiveRAG_Azure_SubPlan2_WebSearch_Foundry.md   Azure Sub-Plan 2 (web search via Foundry agent): design, timings, steps, progress log
 ├── scripts/  seed_admin_user.py  run_backend_dev.{sh,ps1}  run_frontend_dev.{sh,ps1}
@@ -340,7 +340,7 @@ These are facts about the current code that a deployment design must account for
 - **(open question)** Whether a reverse proxy/TLS, health-check wiring (`/health`, `/readiness` exist) and CI are wanted.
 
 ## 15. Working conventions
-- The work proceeds one numbered plan point at a time, each with an explanation and full-file code.
+- The work proceeds one numbered plan point at a time.
 - Existing planning documents are left intact; new plans go in new `.md` files.
 - `AdaptiveRAG_Implementation_Plan.md` deliberately left local/cloud deployment out; deployment is a separate piece of work.
 - Development is on Windows (PowerShell, `.venv\Scripts\activate`).
