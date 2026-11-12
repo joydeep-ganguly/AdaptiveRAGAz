@@ -8,6 +8,8 @@ is `D:\CVProjects\AdaptiveRAGAz`; section 16 is the progress record, and section
 changed things. The original folder was not modified.
 Updated 2026-10-07 for Azure Sub-Plan 2 (web search through a Microsoft Foundry agent), two small frontend fixes and the push of the Azure
 working copy to its own GitHub repository; sections 2-4 and 8-16 are adjusted, and section 16 holds the record.
+Updated 2026-11-03 for Azure Sub-Plan 3 (RAG filing PDFs moved to Azure Blob Storage; an admin upload now only stores the file);
+sections 2-6, 8, 9 and 12-16 are adjusted, and section 16 holds the record.
 
 ---
 
@@ -23,6 +25,9 @@ That is the next piece of work.
 whole project ends up on Azure is decided later. Sub-Plan 1 (code-execution datasets to Azure Blob Storage) and Sub-Plan 2
 (web search through a Foundry agent, DuckDuckGo as fallback) are complete; see section 16. The Azure working copy now
 has its own git repository, pushed to `https://github.com/joydeep-ganguly/AdaptiveRAGAz.git` (section 11).
+**Update 2026-11-03:** Sub-Plan 3 (RAG filing PDFs to Azure Blob Storage) is complete, apart from one deferred step. The admin PDF
+upload now only stores the file in Blob Storage and no longer ingests it; indexing is left to the next sub-plan (Azure AI Search).
+See section 16.
 
 ---
 
@@ -42,7 +47,9 @@ One LangGraph state machine (`AgentState`) routes each user question to one of f
   `@lru_cache`d.
 - Short-term memory is LangGraph's `SqliteSaver` on `checkpoints.db`, keyed by `thread_id`. The app uses the
   conversation UUID as the thread id.
-- The financial corpus is 10-K/10-Q/8-K PDFs for Amazon, Apple and Google, stored in `data/rag_data/{company}/`.
+- The financial corpus is 10-K/10-Q/8-K PDFs for Amazon, Apple and Google, kept locally in `data/rag_data/{company}/` and, since
+  Sub-Plan 3, uploaded to Azure Blob Storage (`rag/rag_data/{company}/`). Retrieval still queries the local Chroma index, which
+  holds the 20 PDFs ingested before Sub-Plan 3.
 
 ---
 
@@ -56,6 +63,7 @@ Streamlit (frontend/)  --HTTP + Bearer JWT-->  FastAPI (backend/app)
                                                   |-- Chroma dir        financial doc vectors
                                                   |-- employees db      SQL agent target
                                                   |-- Azure Blob        code-execution datasets (code_data/ prefix)
+                                                  |-- Azure Blob        RAG filing PDFs (rag container, rag_data/ prefix); stored only, not read by the app yet
                                                   |-- Foundry agent     web search (adaptiverag-websearch), by name, stateless
                                                   `-- E2B / DuckDuckGo (fallback) / Gemini  (external)
 ```
@@ -80,7 +88,8 @@ AdaptiveRAG/
 ├── PROJECT_SUMMARY.md                      this file
 ├── AdaptiveRAG_Azure_SubPlan1_CodeData_Blob.md   Azure Sub-Plan 1 (code data to Blob): design, steps, progress log
 ├── AdaptiveRAG_Azure_SubPlan2_WebSearch_Foundry.md   Azure Sub-Plan 2 (web search via Foundry agent): design, timings, steps, progress log
-├── scripts/  seed_admin_user.py  run_backend_dev.{sh,ps1}  run_frontend_dev.{sh,ps1}
+├── AdaptiveRAG_Azure_SubPlan3_RAG_Blob.md   Azure Sub-Plan 3 (RAG PDFs to Blob): design, steps, progress log
+├── scripts/  seed_admin_user.py  run_backend_dev.{sh,ps1}  run_frontend_dev.{sh,ps1}  verify_rag_data_blob.py (read-only blob vs local check)
 ├── backend/
 │   ├── .env (not committed)  .env.example  pyproject.toml  requirements/{base,backend,dev}.txt
 │   ├── app/
@@ -94,8 +103,8 @@ AdaptiveRAG/
 │   │   ├── auth/           security.py oauth2.py
 │   │   ├── db/             models.py session.py crud.py init_db.py
 │   │   ├── services/       auth_service.py chat_service.py
-│   │   └── storage/        __init__.py code_data_store.py   (Azure Blob access for the code-execution datasets)
-│   ├── data/rag_data/{amazon,apple,google}/   PDFs
+│   │   └── storage/        __init__.py code_data_store.py rag_data_store.py   (Azure Blob access for the code-execution datasets and the RAG filings)
+│   ├── data/rag_data/{amazon,apple,google}/   PDFs (local copies, no longer read by the app; 3 of the 20 are also in Blob, the rest follow in Sub-Plan 3 Step 6b)
 │   ├── (data/code_data/ removed in Sub-Plan 1: the 4 datasets now live in Azure Blob, stadaptiverag32/code-execution/code_data/)
 │   ├── storage/
 │   │   ├── sqlite/         app.db (~32 KB), checkpoints.db (~5.3 MB), employees_db-full-1.0.6.db (~290.7 MB)
@@ -103,7 +112,7 @@ AdaptiveRAG/
 │   │   ├── media/          generated chart PNGs (runtime output, git-ignored)
 │   │   └── debug_logs/     per-conversation debug output (runtime, git-ignored)
 │   ├── tests/  conftest.py  unit/  integration/
-│   └── test_agent_manual.py  test_auth_security_manual.py  test_services_manual.py  test_code_data_store_manual.py  test_code_agent_manual.py  test_foundry_web_search_manual.py  test_web_search_agent_manual.py   (manual sanity scripts, not collected by pytest)
+│   └── test_agent_manual.py  test_auth_security_manual.py  test_services_manual.py  test_code_data_store_manual.py  test_rag_data_store_manual.py  test_code_agent_manual.py  test_foundry_web_search_manual.py  test_web_search_agent_manual.py   (manual sanity scripts, not collected by pytest)
 └── frontend/
     ├── .env (not committed)  .env.example  requirements.txt  config.py  api_client.py  streamlit_app.py
     ├── components/  auth_forms.py chat_window.py sidebar.py
@@ -156,13 +165,15 @@ carries `media_filenames`, and `chat_window.py` fetches and shows them with `st.
   `/auth/register` always creates `"user"` and never reads a `type` from the request. Only `POST /admin/users` accepts a type.
 - `get_current_admin_user` dependency (token → user → active check → admin check, 403 on failure).
 - `data/` split into `rag_data/` (PDFs) and `code_data/` (csv/xlsx); `config.py` has `rag_data_dir` and `code_data_dir`.
-  (Sub-Plan 1 later moved `code_data/` to Azure Blob and removed `code_data_dir`; see section 16.)
+  (Sub-Plan 1 later moved `code_data/` to Azure Blob and removed `code_data_dir`; see section 16. Sub-Plan 3 moved the PDF
+  uploads to Blob too; `rag_data_dir` stays until the local PDFs are retired.)
 - Admin-only uploads. Code data: `.csv`/`.xlsx` into `code_data/` (since Sub-Plan 1: into Azure Blob). RAG data: PDF plus form fields (company, doc type,
   fiscal year, optional quarter). The backend builds the filename itself (`{company} {doc_type} [{quarter}] {year}.pdf`),
-  saves to `rag_data/{company}/`, then runs `ingest_docs_in_vectordb` on that one file.
+  saves to `rag_data/{company}/`, then runs `ingest_docs_in_vectordb` on that one file. (Since Sub-Plan 3 the PDF goes to Azure Blob
+  and nothing is ingested on upload; see section 16.)
 - `retrieval/ingestion.py` is ported from the notebook. It uses the shared `vector_store` and recomputes the
   processed-hash set on every call. It returns `{"skipped": bool, "pages_ingested": int}`. Docling is pinned
-  (`docling==2.66.0`, `docling-core==2.67.1`, `docling-parse==4.7.3`).
+  (`docling==2.66.0`, `docling-core==2.67.1`, `docling-parse==4.7.3`). Since Sub-Plan 3 nothing calls it; it stays until Azure AI Search takes over the ingestion.
 - Frontend: `3_Admin.py` (tabs: create user, upload analysis data, upload RAG document) is gated on
   `st.session_state.user_type == "admin"`.
 - The `app.db` reset (delete, `init_db`, `seed_admin_user`) was done once and the first user came out as admin.
@@ -192,6 +203,11 @@ Since Sub-Plan 1, `POST /admin/uploads/code-data` stores the file in Azure Blob 
 overwrites) and returns 400 for an invalid name or extension, 413 above the size limit (50 MB by default) and 502 when
 storage fails.
 
+Since Sub-Plan 3, `POST /admin/uploads/rag-data` stores the PDF in Azure Blob Storage as `rag_data/{company}/{constructed name}`
+(silent overwrite; content type and blob metadata set) and returns `{filename, message}`. It no longer ingests anything. It returns 400
+for a non-`.pdf` name, a bad company name, a fiscal year outside 1950-2050 or content that is not a PDF, 413 above the size limit
+(20 MB by default), 502 when storage fails, and 422 for an unknown document type or quarter (rejected by the form enums).
+
 ## 7. Data model (`app.db`)
 - `users`: id, username (unique), email (unique), hashed_password, `type`, is_active, created_at
 - `conversations`: id (UUID string, doubles as the LangGraph `thread_id`), user_id → users, title, created_at, updated_at
@@ -207,25 +223,30 @@ resolved in `config.py`. Frontend `.env`: `API_BASE_URL` (default `http://localh
 Azure keys (Sub-Plan 1): `AZURE_STORAGE_ACCOUNT_NAME` (optional at startup, needed for code execution and dataset upload),
 `AZURE_STORAGE_CONTAINER` (default `code-execution`), `AZURE_STORAGE_CODE_DATA_PREFIX` (default `code_data/`),
 `CODE_DATA_MAX_UPLOAD_MB` (default 50). Auth is `DefaultAzureCredential` (`az login` locally); no keys or connection strings.
+Sub-Plan 3 adds `AZURE_STORAGE_RAG_CONTAINER` (default `rag`), `AZURE_STORAGE_RAG_DATA_PREFIX` (default `rag_data/`) and
+`RAG_DATA_MAX_UPLOAD_MB` (default 20) on the same account; `RAG_DATA_DIR` stays until the local PDFs are retired.
 Foundry keys (Sub-Plan 2, all optional): `FOUNDRY_PROJECT_ENDPOINT` (blank means DuckDuckGo only), `FOUNDRY_WEB_SEARCH_AGENT_NAME`
 (default `adaptiverag-websearch`), `FOUNDRY_REQUEST_TIMEOUT_SECONDS` (default 45; `.env` uses 40),
 `WEB_SEARCH_FALLBACK_ENABLED` (default true). The real `.env` holds the endpoint; `.env.example` leaves it blank.
 
 ## 9. Tests
 `cd backend && pytest`, with `pyproject.toml` setting `pythonpath=["."]` and `testpaths=["tests"]`. The latter keeps
-pytest from collecting the three root-level manual scripts, which call live APIs.
-- Unit: security, crud, ranking, router (fake LLM), sql_tools validation, admin auth logic, `code_data_store` (fake
-  container), code-execution tools/node/prompt (fake store, sandbox and `create_agent`).
+pytest from collecting the three root-level manual scripts, which call live APIs. Always run it from `backend/`: from the project
+root pytest does not read that setting and collects the manual scripts too (they call live APIs, and `test_services_manual.py` is
+stale and fails because `send_message` now returns a tuple).
+- Unit: security, crud, ranking, router (fake LLM), sql_tools validation, admin auth logic, `code_data_store` and
+  `rag_data_store` (fake containers), code-execution tools/node/prompt (fake store, sandbox and `create_agent`).
 - Integration (TestClient): auth, conversations, chat, admin endpoints.
 - Fixtures: in-memory SQLite with `StaticPool`; `FakeGraph` (with `get_state`, so the chart-scoping logic works);
   `client` is deliberately **not** used as a context manager, so `lifespan` (the real graph build) never runs;
-  `non_admin_auth_headers` exists because the first registered user is always admin; `admin_upload_dirs` monkeypatches
-  `app.api.routers.admin.get_settings` to a tmp RAG dir; `fake_code_data_blob` is an in-memory stand-in for the Azure
-  container behind `code_data_store` (1 MB limit) for the code-data upload tests.
+  `non_admin_auth_headers` exists because the first registered user is always admin; `fake_code_data_blob` and
+  `fake_rag_data_blob` are in-memory stand-ins for the Azure containers behind `code_data_store` and `rag_data_store`
+  (1 MB limit) for the upload tests. (`admin_upload_dirs` was removed in Sub-Plan 3.)
 - Sub-Plan 2 tests: `test_foundry_web_search.py` (response parsing, Sources formatting, error mapping, cached client, the
   wall-clock deadline), `test_web_search_node.py` (Foundry success, failure with and without fallback, not configured, the
   DuckDuckGo helper failing) and `test_web_tools.py` (`ddgs` exceptions, empty results, formatting), all with fakes.
-  The suite stood at 144 passed at the end of Sub-Plan 2.
+  The suite stood at 144 passed at the end of Sub-Plan 2, and at 226 passed after Sub-Plan 3 Step 4 (71 new `rag_data_store`
+  unit tests and 12 new RAG upload endpoint tests, replacing one old test).
 - Never run in tests: live Gemini, E2B, DuckDuckGo, Azure, Foundry, docling ingestion, the real `app.db` or `data/` folders.
 - The suite passed at the end of the original plan's point 9; the Phase 2 tests were added afterwards.
 - Not covered by automated tests: the `/media` endpoint and the chart-filename extraction in `chat_service`.
@@ -278,6 +299,9 @@ pytest from collecting the three root-level manual scripts, which call live APIs
   never at import, because `tests/conftest.py` imports `app.main`, which imports the agent graph and `code_tools`.
 - All code-data rules (bare `.csv`/`.xlsx` names, size limit, blob prefix) live in `app/storage/code_data_store.py`; the
   admin router and the agent tools only translate its errors.
+- All RAG filing rules live in `app/storage/rag_data_store.py`: the file name is built from the form fields (never from the uploaded
+  name) and parsed back strictly, company/type/year/quarter are validated with `DocType` and `FiscalQuarter` from `agent/schemas.py`,
+  plus the 20 MB limit and a `%PDF-` header check. The admin router only translates its errors, and the upload only stores the file.
 - All Foundry access sits in `app/agent/tools/foundry_web_search.py`: lazy cached client (never at import), one error type
   (`FoundryWebSearchError`) at the boundary, and a wall-clock deadline (worker thread plus `join`) because the OpenAI client's
   `timeout` only limits each network phase. `web_search_node` decides between Foundry, the DuckDuckGo fallback and the
@@ -292,7 +316,11 @@ pytest from collecting the three root-level manual scripts, which call live APIs
 - **E2B sandboxes are an in-process dict.** They are not shared between processes and not cleaned up on shutdown.
 - **No schema migrations** (see section 7).
 - **RAG re-upload:** a corrected version of an already-ingested filing gets a different hash and is added alongside the
-  old chunks rather than replacing them. There is no delete or replace flow for ingested documents.
+  old chunks rather than replacing them. There is no delete or replace flow for ingested documents. (Since Sub-Plan 3 this concerns
+  only the existing Chroma index: a re-upload of the same company, type and period overwrites the blob and nothing is ingested.)
+- **New RAG uploads are not searchable (since Sub-Plan 3):** an uploaded filing is only stored in Blob Storage, while chat retrieval
+  uses the local Chroma index, which is frozen at the 20 PDFs ingested earlier. The Azure AI Search sub-plan is meant to close this.
+  The app can list, download and upload RAG blobs but not delete them.
 - **First-user race:** two simultaneous registrations on an empty DB could both become admin (accepted for an internal tool).
 - **Validation is keyword-based:** `validate_sql_query` rejects non-SELECT and a list of dangerous keywords. It is not a
   read-only connection.
@@ -325,8 +353,9 @@ These are facts about the current code that a deployment design must account for
 - **Secrets:** `GOOGLE_API_KEY`, `E2B_API_KEY` and `JWT_SECRET_KEY` come from `.env` today.
 - **Azure access (Sub-Plan 1):** the code-execution datasets are already off local disk. Locally the backend uses the developer's
   `az login`; when hosted in Azure it needs a managed identity with Storage Blob Data Contributor on the storage account.
-- **Long requests:** a RAG PDF upload does docling conversion plus per-page embeddings inside one request. The frontend
-  allows up to 180 s for it, and 120 s for a chat turn, so any proxy or timeout in front must allow that.
+- **Long requests:** since Sub-Plan 3 a RAG PDF upload only stores the file (the frontend allows 60 s); before that it did docling
+  conversion plus per-page embeddings inside one request (180 s). A chat turn still gets 120 s, so any proxy or timeout in front
+  must allow that.
 - **Two processes:** the backend and Streamlit are separate processes joined by `API_BASE_URL`. The frontend calls the
   backend server-side via httpx, so browser CORS is not involved **(observation)**.
 - **Install weight:** docling makes `pip install` large and slow. `requirements/` is already split into base, backend and dev.
@@ -335,6 +364,7 @@ These are facts about the current code that a deployment design must account for
 - **Azure access (Sub-Plan 2):** when hosted in Azure, the managed identity also needs the **Foundry User** role on the Foundry
   project. The worst-case chat turn for a web question is about 104 s (router 2.4 s + Foundry limit 40 s + DuckDuckGo fallback
   about 61 s), under the frontend's 120 s limit, so a proxy in front must allow at least that.
+- **Azure access (Sub-Plan 3):** the same identity and role as Sub-Plan 1, on the second container (`rag`).
 - **(open question)** Which hosting target and process model to use, and whether SQLite stays or moves to a server DB.
 - **(open question)** Where persistent data (`storage/`, `data/`) lives and how it is backed up.
 - **(open question)** Whether a reverse proxy/TLS, health-check wiring (`/health`, `/readiness` exist) and CI are wanted.
@@ -351,7 +381,7 @@ These are facts about the current code that a deployment design must account for
 
 ---
 
-## 16. Azure deployment progress (updated 2026-10-07)
+## 16. Azure deployment progress (updated 2026-11-03)
 
 The move to Azure is incremental: one sub-plan at a time, each with its own `.md` file and checklist. Whether the whole
 project moves to Azure is decided later. Work happens in `D:\CVProjects\AdaptiveRAGAz`.
@@ -359,10 +389,11 @@ project moves to Azure is decided later. Work happens in `D:\CVProjects\Adaptive
 **Azure resources** (created in the Portal; the subscription already existed): resource group `rg-adaptiverag`,
 storage account `stadaptiverag32` (hierarchical namespace off), private container `code-execution`, datasets as blobs under
 the virtual folder `code_data/`. For Sub-Plan 2: Foundry resource `fn-adaptiverag`, project `proj-adaptiverag`, agent
-`adaptiverag-websearch` (model deployment `gpt-5.4`, built-in Web Search tool, instructions kept in Foundry).
+`adaptiverag-websearch` (model deployment `gpt-5.4`, built-in Web Search tool, instructions kept in Foundry). For Sub-Plan 3: private
+container `rag` in the same storage account, blobs under `rag_data/{amazon,apple,google}/` (one PDF each for now).
 
-**Still on local disk for now:** `app.db`, `checkpoints.db`, the Chroma index, the employee DB, `data/rag_data/` PDFs and
-`storage/media/` chart files.
+**Still on local disk for now:** `app.db`, `checkpoints.db`, the Chroma index, the employee DB, the local `data/rag_data/` PDF copies
+(no longer read by the app) and `storage/media/` chart files.
 
 ### Sub-Plan 1: code-execution datasets, local `backend/data/code_data` to Azure Blob (complete, 2026-10-06)
 
@@ -424,8 +455,45 @@ name only; the agent's tool choice is left to the model (no forced `tool_choice`
 **Open items from Sub-Plan 2:** none blocking. Possible later changes: put today's date into the fallback prompt, force `tool_choice`, show a note when
 the fallback answered, or generate real conversation titles.
 
+### Sub-Plan 3: RAG filing PDFs, local `backend/data/rag_data` to Azure Blob (complete, 2026-11-03; Step 6b deferred)
+
+Plan and progress log: `AdaptiveRAG_Azure_SubPlan3_RAG_Blob.md` (Steps 1-8 ticked; only the deferred Step 6b is open). Scope is the
+blob side only: the Azure AI Search pieces (data source, index,
+skillset, indexer) are Sub-Plan 4, so nothing flows into Search or Chroma after an upload.
+
+| Area | Change |
+|---|---|
+| `app/config.py`, `.env.example` | Added `azure_storage_rag_container` (`rag`), `azure_storage_rag_data_prefix` (`rag_data/`) and `rag_data_max_upload_mb` (20); no new packages; `rag_data_dir` stays until Step 6b |
+| `app/storage/rag_data_store.py` (new) | `upload`, `list_files`, `download`, `build_filename`, `parse_filename`; validates the `.pdf` extension, company (`[a-z0-9-]+`), `DocType`, `FiscalQuarter`, year 1950-2050, size and the `%PDF-` header before sending; writes `rag_data/{company}/{company} {doc_type} [{quarter}] {year}.pdf` with content type `application/pdf` and blob metadata (company, type, year, quarter when present); silent overwrite; lazy cached client with `DefaultAzureCredential`; errors `InvalidRagDataFieldsError`, `RagDataFileTooLargeError`, `RagDataFileNotFoundError`, `RagDataStorageError` |
+| `api/routers/admin.py`, `api/schemas/admin.py` | `upload_rag_data_file` calls `rag_data_store.upload`; 400 / 413 / 502 mapping with a generic 502 message; returns `FileUploadResponse`; no ingestion import; `IngestionResponse` removed |
+| Frontend | `3_Admin.py` RAG tab: "Upload a financial filing", a plain Upload button, a note that the file is stored but not yet searchable; `api_client.upload_rag_data_file` timeout 180 s to 60 s |
+| `retrieval/ingestion.py` | Unchanged and no longer called; stays until Sub-Plan 4 |
+| Tests and scripts | New `tests/unit/test_rag_data_store.py` (71 tests); `conftest.py` `fake_rag_data_blob` replaces `admin_upload_dirs`; 12 RAG upload endpoint tests; manual `test_rag_data_store_manual.py`; read-only `scripts/verify_rag_data_blob.py` (blob vs local by size and SHA-256; `--require-all` makes pending files an error) |
+| Docs | `README.md` and this file |
+
+**Decisions:** separate settings for the `rag` container and prefix on the shared account; silent overwrite; 20 MB cap; blob metadata
+tags written for now (only admin-route uploads get them, so the file name stays the source of truth, and how metadata reaches the index
+fields is decided in Sub-Plan 4, probably with a custom skill that parses the name); `%PDF-` header check; response model reused;
+`ingestion.py` kept but unused; no hash-based duplicate check (the indexer's change tracking is expected to cover it). Blob holds only 3
+test PDFs (`amazon 10-k 2023`, `apple 8-k q4 2023`, `google 10-k 2023`) so the first indexer run is small; the other 17 are copied by
+the developer after the indexer works (Step 6b), and the local folder is retired then.
+
+**Verification:** pytest 215 passed after Step 3 and 226 after Step 4 (and again in the final run from `backend/`); smoke script against
+the real container (listing, name convention, download, throwaway upload with content type and metadata, then deleted); Admin-page
+uploads with an annual and a quarterly name, both with the expected content type and metadata, a bad company name showing the expected
+error, and a same-name re-upload overwriting the blob; test blobs deleted afterwards; the Chroma document count stayed at 1270 before and
+after the uploads (nothing ingested); an Amazon 2023 chat question was still answered from Chroma, with references to the Amazon 10-K
+2023; `verify_rag_data_blob.py` reported 3 identical, 17 pending, no problems.
+
+**Open items from Sub-Plan 3:** the deferred Step 6b (copy the remaining 17 PDFs to Blob, verify with `--require-all`, then retire the
+local `data/rag_data` folder and `rag_data_dir`); `test_services_manual.py` is stale (it treats the `send_message` tuple as a message);
+`chroma.sqlite3` (Git LFS) shows as modified whenever the app has opened it, so leave it out of commits.
+
+**Next:** Sub-Plan 4 (Azure AI Search: data source, index, skillset and indexer on the `rag`
+container, retrieval switched from Chroma, then `ingestion.py`, docling and the Chroma folder retired).
+
 ### Git repository for the Azure working copy (2026-10-07)
 Pushed to `https://github.com/joydeep-ganguly/AdaptiveRAGAz.git`, branch `main`, commit `1c940b6`; details in section 11. Later commits
 keep `app.db` and `checkpoints.db` out (they are ignored), and `git status` should be checked for `.env` files before each push.
 
-**Next:** not yet decided. Further sub-plans are not defined yet.
+**Next:** Sub-Plan 4: Azure AI Search for the RAG PDFs, then the deferred Step 6b of Sub-Plan 3. No other sub-plans are defined yet.

@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -62,6 +63,30 @@ class Settings(BaseSettings):
     azure_storage_container: str = "code-execution"
     azure_storage_code_data_prefix: str = "code_data/"
     code_data_max_upload_mb: int = 50
+
+    # ------------------------------------------------------------------ #
+    # Azure Blob Storage — RAG filing PDFs. Same account and auth as the
+    # code-data settings above, separate container. Blob names are
+    # {prefix}{company}/{company} {doc_type} [{quarter}] {year}.pdf
+    # ------------------------------------------------------------------ #
+    azure_storage_rag_container: str = "rag"
+    azure_storage_rag_data_prefix: str = "rag_data/"
+    rag_data_max_upload_mb: int = 20
+    
+    # ------------------------------------------------------------------ #
+    # Azure AI Search — RAG retrieval (Sub-Plan 4). retrieval_backend picks
+    # where retriever_docs reads from: "chroma" (local, default) or "azure".
+    # All optional at startup, so tests and local runs never need Azure.
+    # Auth is DefaultAzureCredential (az login locally, managed identity in
+    # Azure); the identity needs "Search Index Data Reader" on the service.
+    # Keyword mode: "hard" = a page must contain at least one ranking keyword
+    # (like Chroma's $contains); "hybrid" = keywords only add to the score.
+    # ------------------------------------------------------------------ #
+    retrieval_backend: Literal["chroma", "azure"] = "chroma"
+    azure_search_endpoint: str | None = None
+    azure_search_index_name: str = "idx-adaptiverag-trial"
+    azure_search_keyword_mode: Literal["hard", "hybrid"] = "hard"
+    azure_search_exhaustive: bool = False
 
     # ------------------------------------------------------------------ #
     # Foundry web search agent (Azure AI Foundry project).

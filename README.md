@@ -38,18 +38,19 @@ DuckDuckGo box is now the fallback, used when Foundry is not configured or fails
 - Python 3.10+
 - A Google AI Studio API key (`GOOGLE_API_KEY`)
 - An E2B API key (`E2B_API_KEY`) — powers the code-execution sandbox
-- An Azure Storage account with a private blob container that holds the code-execution
-  datasets, the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli)
+- An Azure Storage account with private blob containers that hold the code-execution
+  datasets and the RAG filing PDFs, the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli)
   (`az login`), and the **Storage Blob Data Contributor** role on that account
 - Optional, for web search through Microsoft Foundry: a Foundry project with an agent named
   `adaptiverag-websearch` that has the built-in Web Search tool, and the **Foundry User**
   role on that project. Without it, web questions are answered through DuckDuckGo only.
 
-The backend's `storage/` (Chroma index, employee database) and `data/` (sample
-filings) folders are expected to already be present in the repo — some of these
-are large binary files handled via Git LFS or shared separately; ask a teammate
-if they're missing after cloning. The code-execution datasets are not in the repo:
-they live in Azure Blob Storage (see "Azure Blob Storage" below).
+The backend's `storage/` folder (Chroma index, employee database) is expected to
+already be present in the repo — some of these are large binary files handled via
+Git LFS or shared separately; ask a teammate if they're missing after cloning. The
+code-execution datasets and the uploaded RAG filings are not read from disk: they
+live in Azure Blob Storage (see "Azure Blob Storage" below). `data/rag_data/` still
+holds local copies of the sample filings, but the app no longer reads it.
 
 ## Setup
 
@@ -68,13 +69,14 @@ copy .env.example .env                # Windows; `cp .env.example .env` on macOS
 Fill in `.env`: at minimum `GOOGLE_API_KEY`, `E2B_API_KEY`, and `JWT_SECRET_KEY`
 (any random string signs login tokens — e.g. generate one with
 `python -c "import secrets; print(secrets.token_hex(32))"`), plus
-`AZURE_STORAGE_ACCOUNT_NAME` for the code-execution datasets (next section). Web search
+`AZURE_STORAGE_ACCOUNT_NAME` for the Blob Storage datasets and filings (next section). Web search
 through Foundry is optional and has its own settings (the section after that).
 
-#### Azure Blob Storage (code-execution datasets)
+#### Azure Blob Storage (code-execution datasets and RAG filings)
 
 The code-execution agent reads its `.csv`/`.xlsx` datasets from Azure Blob Storage,
-and the Admin page uploads new ones there. Sign in once with the Azure CLI:
+and the Admin page uploads new ones there. The Admin page also uploads the RAG filing
+PDFs to Blob Storage (second table below). Sign in once with the Azure CLI:
 
 ```bash
 az login
@@ -86,14 +88,31 @@ Your identity needs the **Storage Blob Data Contributor** role on the storage ac
 
 | `.env` setting | Default | Meaning |
 |---|---|---|
-| `AZURE_STORAGE_ACCOUNT_NAME` | *(none — required)* | Storage account name |
+| `AZURE_STORAGE_ACCOUNT_NAME` | *(none — required)* | Storage account name (shared by both containers) |
 | `AZURE_STORAGE_CONTAINER` | `code-execution` | Container holding the datasets |
 | `AZURE_STORAGE_CODE_DATA_PREFIX` | `code_data/` | Folder (blob prefix) inside the container |
 | `CODE_DATA_MAX_UPLOAD_MB` | `50` | Largest dataset the Admin page accepts |
 
-Only `.csv`/`.xlsx` files directly under the prefix are used. The backend starts
-without Azure configured; only the code-execution agent and the Admin dataset
-upload report an error until it is.
+Only `.csv`/`.xlsx` files directly under the prefix are used.
+
+The RAG filing PDFs go to a second container of the same account, one folder per
+company, named from the upload form fields:
+`rag/rag_data/{company}/{company} {doc_type} [{quarter}] {year}.pdf`
+(for example `rag_data/amazon/amazon 10-q q1 2024.pdf`).
+
+| `.env` setting | Default | Meaning |
+|---|---|---|
+| `AZURE_STORAGE_RAG_CONTAINER` | `rag` | Container holding the filings |
+| `AZURE_STORAGE_RAG_DATA_PREFIX` | `rag_data/` | Folder (blob prefix) inside the container |
+| `RAG_DATA_MAX_UPLOAD_MB` | `20` | Largest PDF the Admin page accepts |
+
+The Admin upload only **stores** the PDF (its company, type, year and quarter are also
+written as blob metadata). It does not index it: indexing into a search index is planned
+as a separate step in Azure, so for now chat answers about filings come from the
+existing local Chroma index and a newly uploaded filing is not searchable yet.
+
+The backend starts without Azure configured; only the code-execution agent and the
+Admin uploads report an error until it is.
 
 #### Foundry web-search agent (web search)
 
@@ -170,10 +189,12 @@ If you're an admin, an **Admin** page appears in the sidebar:
 - Upload a `.csv`/`.xlsx` (up to 50 MB by default) for the code-execution agent to
   analyze. It is stored in Azure Blob Storage, and uploading a file with an
   existing name overwrites it.
-- Upload a financial filing PDF — this stores it and immediately ingests it into
-  the RAG index. You'll provide the company name, document type, fiscal year,
-  and (for quarterly filings) the fiscal quarter, so it's tagged correctly for
-  retrieval.
+- Upload a financial filing PDF (up to 20 MB by default) to Azure Blob Storage. You'll
+  provide the company name, document type, fiscal year, and (for quarterly filings) the
+  fiscal quarter; the file is stored as `{company}/{company} {doc_type} [{quarter}] {year}.pdf`,
+  and uploading the same company, type and period again overwrites it. The upload does
+  not index the filing, so it is not searchable in chat yet (see the Azure Blob Storage
+  section).
 
 ## Running tests
 
@@ -191,10 +212,14 @@ database/data folders — safe to run anytime.
   multi-user use, and the initial build order.
 - `AdaptiveRAG_Phase2_Plan.md` — admin roles, the `rag_data`/`code_data` folder
   split, and the PDF upload/ingestion pipeline. (The `code_data` folder has since
-  moved to Azure Blob Storage — see the next entry.)
+  moved to Azure Blob Storage, and PDF uploads now go to Blob Storage too, with
+  indexing left to Azure — see the next entries.)
 - `AdaptiveRAG_Azure_SubPlan1_CodeData_Blob.md` — moving the code-execution
   datasets from the local `data/code_data` folder to Azure Blob Storage: design,
   steps and progress log.
 - `AdaptiveRAG_Azure_SubPlan2_WebSearch_Foundry.md` — replacing the LangGraph
   web-search agent with the Microsoft Foundry agent `adaptiverag-websearch`
   (DuckDuckGo kept as the fallback): design, timings, steps and progress log.
+- `AdaptiveRAG_Azure_SubPlan3_RAG_Blob.md` — moving the RAG filing PDFs from the local
+  `data/rag_data` folder to Azure Blob Storage (the upload only stores the file; indexing
+  is a later step): design, steps and progress log.

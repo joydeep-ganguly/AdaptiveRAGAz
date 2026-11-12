@@ -125,5 +125,5 @@ def upload_rag_data_file(
         headers=_auth_headers(token),
         files={"file": (filename, file_bytes, "application/pdf")},
         data=data,
-        timeout=180,  # docling conversion + per-page embeddings can take a while for a large filing
+        timeout=60,  # the PDF is only stored in Blob Storage (no ingestion), like the code-data upload
     ).json()

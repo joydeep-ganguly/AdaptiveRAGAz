@@ -1,23 +1,17 @@
-import os
-import re
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
-from app.agent.retrieval.ingestion import ingest_docs_in_vectordb
 from app.agent.schemas import DocType, FiscalQuarter
-from app.api.schemas.admin import AdminCreateUserRequest, FileUploadResponse, IngestionResponse
+from app.api.schemas.admin import AdminCreateUserRequest, FileUploadResponse
 from app.api.schemas.auth import UserResponse
-from app.config import get_settings
 from app.db.models import User
 from app.deps import get_current_admin_user, get_db
 from app.services import auth_service
-from app.storage import code_data_store
+from app.storage import code_data_store, rag_data_store
 
 router = APIRouter(prefix="/admin", tags=["admin"])
-
-_COMPANY_NAME_PATTERN = re.compile(r"^[a-z0-9\-]+$")
 
 
 @router.post("/users", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
@@ -61,7 +55,7 @@ def upload_code_data_file(
 
     return FileUploadResponse(filename=file.filename, message="File uploaded successfully.")
 
-@router.post("/uploads/rag-data", response_model=IngestionResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/uploads/rag-data", response_model=FileUploadResponse, status_code=status.HTTP_201_CREATED)
 def upload_rag_data_file(
     file: UploadFile = File(...),
     company_name: str = Form(...),
@@ -71,46 +65,34 @@ def upload_rag_data_file(
     current_user: User = Depends(get_current_admin_user),
 ):
     """
-    Admin-only. Saves a PDF into rag_data/{company_name}/ using a filename
-    constructed from the form fields (not the uploaded file's own name) so
-    ingestion.extract_metadata_from_filename always succeeds, then triggers
-    ingestion into the shared Chroma index for that one file.
+    Admin-only. Uploads a filing PDF to Azure Blob Storage (rag_data/{company}/)
+    under a filename constructed from the form fields (not the uploaded file's
+    own name), so the name always follows "{company} {doc_type} [{quarter}] {year}.pdf".
+    An existing file with the same name is overwritten. Validation rules live in
+    rag_data_store.
 
-    Deliberately `def`, not `async def` — docling's PDF conversion plus
-    embedding every page is genuinely slow, and this keeps that blocking
-    work in FastAPI's thread pool instead of freezing the server for
-    everyone else (same rule as /chat/{conversation_id}/query, section 4
-    of the original plan, bug #4).
+    This only STORES the file. Nothing is ingested into ChromaDB here: indexing
+    the PDFs is handled by Azure AI Search in a later sub-plan, so a new upload
+    is not searchable in chat yet.
     """
-    settings = get_settings()
-
-    if os.path.splitext(file.filename or "")[1].lower() != ".pdf":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only .pdf files are allowed")
-
-    company_name = company_name.strip().lower()
-    if not _COMPANY_NAME_PATTERN.fullmatch(company_name):
+    try:
+        stored = rag_data_store.upload(
+            file.filename or "",
+            company_name,
+            doc_type,
+            fiscal_year,
+            fiscal_quarter,
+            file.file.read(),
+        )
+    except rag_data_store.InvalidRagDataFieldsError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except rag_data_store.RagDataFileTooLargeError as exc:
+        raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail=str(exc))
+    except rag_data_store.RagDataStorageError:
+        # Azure detail is already logged by rag_data_store; don't leak it to the client.
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="company_name may only contain lowercase letters, digits, and hyphens",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not store the file in Azure Blob Storage. Please try again later.",
         )
 
-    name_parts = [company_name, doc_type.value]
-    if fiscal_quarter is not None:
-        name_parts.append(fiscal_quarter.value)
-    name_parts.append(str(fiscal_year))
-    constructed_filename = " ".join(name_parts) + ".pdf"
-
-    company_dir = settings.resolved_rag_data_dir / company_name
-    company_dir.mkdir(parents=True, exist_ok=True)
-    destination = company_dir / constructed_filename
-
-    with open(destination, "wb") as f:
-        f.write(file.file.read())
-
-    result = ingest_docs_in_vectordb(destination)
-
-    return IngestionResponse(
-        filename=constructed_filename,
-        pages_ingested=result["pages_ingested"],
-        skipped=result["skipped"],
-    )
+    return FileUploadResponse(filename=stored.name, message="File uploaded successfully.")

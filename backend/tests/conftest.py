@@ -10,7 +10,7 @@ from app.db.models import Base
 from app.db.session import get_db_session
 from app.deps import get_agent_graph
 from app.main import app
-from app.storage import code_data_store
+from app.storage import code_data_store, rag_data_store
 
 
 @pytest.fixture()
@@ -122,22 +122,39 @@ def non_admin_auth_headers(client, auth_headers):
 
 
 @pytest.fixture()
-def admin_upload_dirs(tmp_path, monkeypatch):
+def fake_rag_data_blob(monkeypatch):
     """
-    Points the admin router's RAG upload destination at a throwaway tmp_path
-    directory instead of the real backend/data/rag_data. Without this, the RAG
-    upload endpoint would write real files into the actual project data folder
-    on every test run — get_settings() is called directly inside admin.py's
-    route body, not via Depends(), so app.dependency_overrides can't intercept
-    it the way it does for the DB and the agent graph.
-    (Code-data uploads go to Azure Blob — see fake_code_data_blob.)
+    In-memory stand-in for the Azure container behind rag_data_store, so the
+    admin RAG upload endpoint is tested through the real validation, naming and
+    size-limit logic without ever touching Azure. The limit is 1 MB here to keep
+    oversize tests small. Set `.error` to make the fake container raise on upload.
     """
-    rag_dir = tmp_path / "rag_data"
+    settings = SimpleNamespace(
+        azure_storage_account_name="test-account",
+        azure_storage_rag_container="test-rag-container",
+        azure_storage_rag_data_prefix="rag_data/",
+        rag_data_max_upload_mb=1,
+    )
+    container = SimpleNamespace(blobs={}, uploads=[], error=None)
 
-    fake_settings = SimpleNamespace(resolved_rag_data_dir=rag_dir)
-    monkeypatch.setattr("app.api.routers.admin.get_settings", lambda: fake_settings)
+    def upload_blob(name, data, overwrite=False, content_settings=None, metadata=None):
+        if container.error:
+            raise container.error
+        container.blobs[name] = data.read() if hasattr(data, "read") else data
+        container.uploads.append(
+            SimpleNamespace(
+                name=name,
+                overwrite=overwrite,
+                content_type=content_settings.content_type,
+                metadata=metadata,
+            )
+        )
 
-    return SimpleNamespace(rag_dir=rag_dir)
+    container.upload_blob = upload_blob
+
+    monkeypatch.setattr(rag_data_store, "get_settings", lambda: settings)
+    monkeypatch.setattr(rag_data_store, "_get_container_client", lambda: container)
+    return container
 
 
 @pytest.fixture()

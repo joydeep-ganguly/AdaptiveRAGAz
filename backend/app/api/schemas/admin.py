@@ -13,9 +13,3 @@ class AdminCreateUserRequest(BaseModel):
 class FileUploadResponse(BaseModel):
     filename: str
     message: str
-
-
-class IngestionResponse(BaseModel):
-    filename: str
-    pages_ingested: int
-    skipped: bool

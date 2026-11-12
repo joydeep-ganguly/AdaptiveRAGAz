@@ -18,3 +18,4 @@ docling-parse==4.7.3
 azure-storage-blob
 azure-identity
 azure-ai-projects>=2.8.0
+azure-search-documents

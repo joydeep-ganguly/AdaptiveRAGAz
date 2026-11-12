@@ -46,7 +46,11 @@ with tab_code_data:
             st.error(f"Upload failed: {exc.detail}")
 
 with tab_rag_data:
-    st.subheader("Upload a financial filing for RAG ingestion")
+    st.subheader("Upload a financial filing")
+    st.caption(
+        "The PDF is stored in Azure Blob Storage. Indexing it for chat search is a separate step "
+        "that is not in place yet, so a new upload will not be searchable in chat for now."
+    )
     uploaded_pdf = st.file_uploader("PDF file", type=["pdf"], key="rag_data_uploader")
 
     col1, col2 = st.columns(2)
@@ -59,17 +63,14 @@ with tab_rag_data:
             "Fiscal quarter (leave blank for annual reports)", options=["", "q1", "q2", "q3", "q4"]
         )
 
-    if uploaded_pdf is not None and st.button("Upload and ingest", key="upload_rag_data_button"):
-        with st.spinner("Uploading and ingesting — this can take a while for a large filing…"):
+    if uploaded_pdf is not None and st.button("Upload", key="upload_rag_data_button"):
+        with st.spinner("Uploading to Blob Storage…"):
             try:
                 result = api_client.upload_rag_data_file(
                     token, uploaded_pdf.getvalue(), uploaded_pdf.name,
                     company_name=company_name, doc_type=doc_type,
                     fiscal_year=int(fiscal_year), fiscal_quarter=fiscal_quarter or None,
                 )
-                if result["skipped"]:
-                    st.info(f"'{result['filename']}' was already ingested — skipped.")
-                else:
-                    st.success(f"Ingested '{result['filename']}' — {result['pages_ingested']} pages added.")
+                st.success(f"Uploaded '{result['filename']}' to Blob Storage.")
             except api_client.ApiError as exc:
-                st.error(f"Upload/ingestion failed: {exc.detail}")
+                st.error(f"Upload failed: {exc.detail}")

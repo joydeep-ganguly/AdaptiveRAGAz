@@ -24,3 +24,4 @@ backend/storage/media/
 # Runtime databases: user accounts and chat history
 backend/storage/sqlite/app.db
 backend/storage/sqlite/checkpoints.db
+Claude outputs/
