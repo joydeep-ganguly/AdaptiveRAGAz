@@ -71,9 +71,9 @@ def upload_rag_data_file(
     An existing file with the same name is overwritten. Validation rules live in
     rag_data_store.
 
-    This only STORES the file. Nothing is ingested into ChromaDB here: indexing
-    the PDFs is handled by Azure AI Search in a later sub-plan, so a new upload
-    is not searchable in chat yet.
+    This only STORES the file. Nothing is ingested here: the Azure AI Search
+    indexer picks up the new blob on its next scheduled run, after which the
+    PDF is searchable in chat.
     """
     try:
         stored = rag_data_store.upload(

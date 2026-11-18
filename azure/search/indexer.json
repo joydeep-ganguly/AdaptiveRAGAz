@@ -1,0 +1,21 @@
+{
+  "name": "ixr-adaptiverag-rag",
+  "description": "Blob rag/rag_data (PDF files) to idx-adaptiverag-trial through ss-adaptiverag-rag.",
+  "dataSourceName": "azureblob-1794320280049-datasource",
+  "skillsetName": "ss-adaptiverag-rag",
+  "targetIndexName": "idx-adaptiverag-trial",
+  "disabled": false,
+  "schedule": {"interval": "PT24H"},
+  "parameters": {
+    "batchSize": 1,
+    "maxFailedItems": 0,
+    "maxFailedItemsPerBatch": 0,
+    "configuration": {
+      "dataToExtract": "storageMetadata",
+      "indexedFileNameExtensions": ".pdf",
+      "parsingMode": "default"
+    }
+  },
+  "fieldMappings": [],
+  "outputFieldMappings": []
+}

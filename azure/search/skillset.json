@@ -1,0 +1,74 @@
+{
+  "name": "ss-adaptiverag-rag",
+  "description": "RAG PDFs: one search document per page. pdf-pages cuts the PDF into markdown pages and parses the file name; embed adds the Gemini vector of each page.",
+  "skills": [
+    {
+      "@odata.type": "#Microsoft.Skills.Custom.WebApiSkill",
+      "name": "pdf-pages",
+      "description": "Document Intelligence layout markdown split into pages, plus company, type, year and quarter from the file name",
+      "context": "/document",
+      "uri": "https://func-adaptiverag-skills.azurewebsites.net/api/pdf-pages",
+      "httpMethod": "POST",
+      "httpHeaders": {
+        "x-functions-key": "<FUNCTION_KEY>"
+      },
+      "timeout": "PT230S",
+      "batchSize": 1,
+      "degreeOfParallelism": 1,
+      "inputs": [
+        { "name": "file_name", "source": "/document/metadata_storage_name" },
+        { "name": "url", "source": "/document/metadata_storage_path" }
+      ],
+      "outputs": [
+        { "name": "company_name", "targetName": "parsed_company_name" },
+        { "name": "doc_type", "targetName": "parsed_doc_type" },
+        { "name": "fiscal_year", "targetName": "parsed_fiscal_year" },
+        { "name": "fiscal_quarter", "targetName": "parsed_fiscal_quarter" },
+        { "name": "source_file", "targetName": "source_file" },
+        { "name": "pages", "targetName": "pages" }
+      ]
+    },
+    {
+      "@odata.type": "#Microsoft.Skills.Custom.WebApiSkill",
+      "name": "embed-pages",
+      "description": "gemini-embedding-001 vector (3072) of every page text, document task type",
+      "context": "/document/pages/*",
+      "uri": "https://func-adaptiverag-skills.azurewebsites.net/api/embed",
+      "httpMethod": "POST",
+      "httpHeaders": {
+        "x-functions-key": "<FUNCTION_KEY>"
+      },
+      "timeout": "PT120S",
+      "batchSize": 10,
+      "degreeOfParallelism": 2,
+      "inputs": [
+        { "name": "text", "source": "/document/pages/*/text" }
+      ],
+      "outputs": [
+        { "name": "vector", "targetName": "vector" }
+      ]
+    }
+  ],
+  "indexProjections": {
+    "selectors": [
+      {
+        "targetIndexName": "idx-adaptiverag-trial",
+        "parentKeyFieldName": "parent_id",
+        "sourceContext": "/document/pages/*",
+        "mappings": [
+          { "name": "page_text", "source": "/document/pages/*/text", "sourceContext": null, "inputs": [] },
+          { "name": "page", "source": "/document/pages/*/page", "sourceContext": null, "inputs": [] },
+          { "name": "vector", "source": "/document/pages/*/vector", "sourceContext": null, "inputs": [] },
+          { "name": "company_name", "source": "/document/parsed_company_name", "sourceContext": null, "inputs": [] },
+          { "name": "doc_type", "source": "/document/parsed_doc_type", "sourceContext": null, "inputs": [] },
+          { "name": "fiscal_year", "source": "/document/parsed_fiscal_year", "sourceContext": null, "inputs": [] },
+          { "name": "fiscal_quarter", "source": "/document/parsed_fiscal_quarter", "sourceContext": null, "inputs": [] },
+          { "name": "source_file", "source": "/document/source_file", "sourceContext": null, "inputs": [] }
+        ]
+      }
+    ],
+    "parameters": {
+      "projectionMode": "skipIndexingParentDocuments"
+    }
+  }
+}

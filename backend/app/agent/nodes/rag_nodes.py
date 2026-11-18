@@ -1,18 +1,27 @@
 import os
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 from langgraph.graph import END
 from langchain_core.runnables import RunnableConfig
 
 from app.agent.debug_utils import write_debug_log
 
-from app.agent.tools.doc_tools import retriever_docs
+from app.agent.tools.doc_tools import retriever_docs, NO_DOCUMENTS_PREFIX
 from app.agent.llm import get_reasoning_llm
 
 llm = get_reasoning_llm()
 
 MAX_ITERATIONS = 3
+
+
+# Fixed reply when nothing relevant was retrieved: the LLM is not called, so it cannot
+# answer from its own memory and cite pages that were never retrieved.
+NO_DOCUMENTS_ANSWER = (
+    "I couldn't find relevant passages for this question in the indexed financial filings "
+    "after several search attempts. Please check that the filing (company, document type, "
+    "year and quarter) has been uploaded and indexed, or try rephrasing the question."
+)
 
 # =============================================================================
 # Pydantic Schemas for Structured Output
@@ -86,11 +95,14 @@ def retrieve_node(state, config: RunnableConfig):
     queries_to_search = rewritten_queries if rewritten_queries else [query]
 
     all_results = []
+    found_any = False
     for idx, search_query in enumerate(queries_to_search,1):
         print(f"[RETRIEVE] Query {idx}: {search_query}")
 
         # pass config through so retriever_docs can namespace its own debug log too
         result = retriever_docs.invoke({'query': search_query, 'k': 3}, config=config)
+        if not str(result).startswith(NO_DOCUMENTS_PREFIX):
+            found_any = True
 
         text = f"## Query {idx}: {search_query}\n\n### Retrieved Documents:\n{result}"
         all_results.append(text)
@@ -100,10 +112,9 @@ def retrieve_node(state, config: RunnableConfig):
     write_debug_log(config, "self_rag.md", combined_result)
 
     return {
-        'retrieved_docs' : combined_result,
+        'retrieved_docs' : combined_result if found_any else '',
         'rewritting_count' : state.get('rewritting_count',0) + 1
     }
-
 
 # Grade document relevance and filter out irrelevant ones
 def grade_documents_node(state):
@@ -112,6 +123,10 @@ def grade_documents_node(state):
 
     query = get_latest_user_query(state['messages'])
     documents = state.get('retrieved_docs','No document available!')
+
+    if not documents or not documents.strip():
+        print("[GRADE] Nothing was retrieved - skipping the relevance check")
+        return {'retrieved_docs': ''}
 
     llm_structured = llm.with_structured_output(GradeDocuments)
 
@@ -143,6 +158,10 @@ def generate_node(state, config: RunnableConfig):
 
     query = get_latest_user_query(state['messages'])
     documents = state.get('retrieved_docs','')
+
+    if not documents or not documents.strip():
+        print("[GENERATE] No documents retrieved - returning the fixed not-found answer")
+        return {'messages': [AIMessage(content=NO_DOCUMENTS_ANSWER)]}
 
     system_prompt = """You are a financial document analyst providing detailed, accurate answers.
 

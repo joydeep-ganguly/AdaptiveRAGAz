@@ -77,7 +77,7 @@ def send_message(token: str, conversation_id: str, message: str) -> dict:
     # calls, so this one gets a longer timeout than the plain CRUD calls above.
     return _request(
         "POST", f"/chat/{conversation_id}/query",
-        json={"message": message}, headers=_auth_headers(token), timeout=120,
+        json={"message": message}, headers=_auth_headers(token), timeout=300,
     ).json()
 
 

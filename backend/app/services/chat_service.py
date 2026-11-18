@@ -80,7 +80,8 @@ def send_message(
 
     crud.add_message(db, conversation.id, role="user", content=user_message)
 
-    config = {"configurable": {"thread_id": conversation.id}}
+    # recursion_limit is a safety net against runaway graph loops (the default is about 10,000 steps)
+    config = {"configurable": {"thread_id": conversation.id}, "recursion_limit": 50}
 
     # result["messages"] is the FULL accumulated thread history — snapshot
     # how many messages existed before this call so we can isolate what
@@ -88,7 +89,16 @@ def send_message(
     previous_state = graph.get_state(config)
     previous_message_count = len(previous_state.values.get("messages", []))
 
-    result = graph.invoke({"messages": [HumanMessage(user_message)]}, config=config)
+    result = graph.invoke(
+        {
+            "messages": [HumanMessage(user_message)],
+            # Retrieval state belongs to ONE question, but the checkpointer keeps it for the
+            # whole conversation: start every question with a fresh counter and no old queries.
+            "rewritting_count": 0,
+            "rewritten_queries": [],
+        },
+        config=config,
+    )
 
     new_messages = result["messages"][previous_message_count:]
 

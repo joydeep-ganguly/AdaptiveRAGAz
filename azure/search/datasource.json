@@ -1,0 +1,18 @@
+{
+  "name": "azureblob-1794320280049-datasource",
+  "description": "Container rag, folder rag_data (RAG filing PDFs). System-assigned managed identity of the search service; native blob soft delete tracks deleted PDFs.",
+  "type": "azureblob",
+  "credentials": {
+    "connectionString": "ResourceId=/subscriptions/<SUBSCRIPTION_ID>/resourceGroups/rg-adaptiverag/providers/Microsoft.Storage/storageAccounts/stadaptiverag32;"
+  },
+  "container": {
+    "name": "rag",
+    "query": "rag_data"
+  },
+  "dataChangeDetectionPolicy": null,
+  "dataDeletionDetectionPolicy": {
+    "@odata.type": "#Microsoft.Azure.Search.NativeBlobSoftDeleteDeletionDetectionPolicy"
+  },
+  "encryptionKey": null,
+  "identity": null
+}

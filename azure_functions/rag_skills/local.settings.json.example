@@ -1,0 +1,13 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "DOCUMENT_INTELLIGENCE_ENDPOINT": "https://di-adaptiverag.cognitiveservices.azure.com",
+    "ALLOWED_BLOB_HOST": "stadaptiverag32.blob.core.windows.net",
+    "GEMINI_API_KEY": "<your Gemini API key>",
+    "EMBEDDING_MODEL": "gemini-embedding-001",
+    "DI_CHUNK_PAGES": "20",
+    "DI_PARALLELISM": "6"
+  }
+}

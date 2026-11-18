@@ -15,3 +15,4 @@ class AgentState(TypedDict):
     messages: Annotated[list, operator.add]
     retrieved_docs: str
     rewritten_queries: list[str]
+    rewritting_count: int

@@ -10,6 +10,8 @@ Updated 2026-10-07 for Azure Sub-Plan 2 (web search through a Microsoft Foundry 
 working copy to its own GitHub repository; sections 2-4 and 8-16 are adjusted, and section 16 holds the record.
 Updated 2026-11-03 for Azure Sub-Plan 3 (RAG filing PDFs moved to Azure Blob Storage; an admin upload now only stores the file);
 sections 2-6, 8, 9 and 12-16 are adjusted, and section 16 holds the record.
+Updated 2026-11-18 for Azure Sub-Plan 4 (Azure AI Search ingests the RAG PDFs and chat retrieval reads from its index, with Chroma kept as a
+switchable fallback); sections 1-4, 8, 9, 13, 14 and 16 are adjusted, and section 16 holds the record.
 
 ---
 
@@ -28,6 +30,11 @@ has its own git repository, pushed to `https://github.com/joydeep-ganguly/Adapti
 **Update 2026-11-03:** Sub-Plan 3 (RAG filing PDFs to Azure Blob Storage) is complete, apart from one deferred step. The admin PDF
 upload now only stores the file in Blob Storage and no longer ingests it; indexing is left to the next sub-plan (Azure AI Search).
 See section 16.
+**Update 2026-11-18:** Sub-Plan 4 (Azure AI Search) is done up to the cutover (Steps 1 to 11 and 13), on a Free-tier search service with 4 of the
+20 PDFs indexed. A PDF uploaded to Blob Storage is indexed by an indexer through two custom skills in an Azure Function, and chat retrieval
+reads from the index (`RETRIEVAL_BACKEND=azure`). Chroma and `ingestion.py` are still in place as the fallback; retiring them and the
+optional paid search service are pending. The aim is to run all sub-agent operations (RAG, SQL, code generation, web search) in the cloud.
+See section 16.
 
 ---
 
@@ -37,7 +44,7 @@ One LangGraph state machine (`AgentState`) routes each user question to one of f
 
 | Route | Nodes | Backing tech |
 |---|---|---|
-| `retrieve` | retrieve → grade_documents → generate, with transform_query retry loop and self-RAG hallucination/answer-quality checks (max 3 iterations) | Chroma persisted index (`storage/chroma_financial_db`, collection `financial_docs`), Gemini embeddings |
+| `retrieve` | retrieve → grade_documents → generate, with transform_query retry loop and self-RAG hallucination/answer-quality checks (max 3 iterations) | Azure AI Search index (`RETRIEVAL_BACKEND=azure`, since Sub-Plan 4) or the Chroma persisted index (`storage/chroma_financial_db`, collection `financial_docs`, `RETRIEVAL_BACKEND=chroma`), Gemini embeddings; the relevance grading is skipped when nothing was retrieved |
 | `sql_agent` | ReAct agent with schema/generate/validate/execute/fix tools | SQLite employee DB (`employees_db-full-1.0.6.db`) |
 | `web_search` | `web_search_node`: one call to the Foundry agent `adaptiverag-websearch`; on failure, the original ReAct agent as fallback | Microsoft Foundry agent with the built-in Web Search tool (answer plus a Sources list); fallback DuckDuckGo via `ddgs` |
 | `code_execution` | ReAct agent with `list_code_data_files`, `upload_file` and `run_python_code` | E2B sandbox, datasets from Azure Blob Storage (`code_data/` prefix) |
@@ -48,8 +55,9 @@ One LangGraph state machine (`AgentState`) routes each user question to one of f
 - Short-term memory is LangGraph's `SqliteSaver` on `checkpoints.db`, keyed by `thread_id`. The app uses the
   conversation UUID as the thread id.
 - The financial corpus is 10-K/10-Q/8-K PDFs for Amazon, Apple and Google, kept locally in `data/rag_data/{company}/` and, since
-  Sub-Plan 3, uploaded to Azure Blob Storage (`rag/rag_data/{company}/`). Retrieval still queries the local Chroma index, which
-  holds the 20 PDFs ingested before Sub-Plan 3.
+  Sub-Plan 3, uploaded to Azure Blob Storage (`rag/rag_data/{company}/`). Since Sub-Plan 4 retrieval queries the Azure AI Search index
+  (`RETRIEVAL_BACKEND=azure`), which holds the PDFs indexed so far (4 of the 20 on 2026-11-18); the local Chroma index still holds 19 of
+  them and is the fallback (`RETRIEVAL_BACKEND=chroma`).
 
 ---
 
@@ -60,10 +68,11 @@ Streamlit (frontend/)  --HTTP + Bearer JWT-->  FastAPI (backend/app)
                                                   |-- app.db            users, conversations, messages (SQLAlchemy)
                                                   |-- LangGraph agent   built once at startup, stored on app.state.graph
                                                   |-- checkpoints.db    LangGraph per-thread memory
-                                                  |-- Chroma dir        financial doc vectors
+                                                  |-- Chroma dir        financial doc vectors (fallback since Sub-Plan 4)
+                                                  |-- Azure AI Search   RAG filing pages (index idx-adaptiverag-trial), read when RETRIEVAL_BACKEND=azure
                                                   |-- employees db      SQL agent target
                                                   |-- Azure Blob        code-execution datasets (code_data/ prefix)
-                                                  |-- Azure Blob        RAG filing PDFs (rag container, rag_data/ prefix); stored only, not read by the app yet
+                                                  |-- Azure Blob        RAG filing PDFs (rag container, rag_data/ prefix); stored by the app and indexed by Azure AI Search
                                                   |-- Foundry agent     web search (adaptiverag-websearch), by name, stateless
                                                   `-- E2B / DuckDuckGo (fallback) / Gemini  (external)
 ```
@@ -89,7 +98,10 @@ AdaptiveRAG/
 ├── AdaptiveRAG_Azure_SubPlan1_CodeData_Blob.md   Azure Sub-Plan 1 (code data to Blob): design, steps, progress log
 ├── AdaptiveRAG_Azure_SubPlan2_WebSearch_Foundry.md   Azure Sub-Plan 2 (web search via Foundry agent): design, timings, steps, progress log
 ├── AdaptiveRAG_Azure_SubPlan3_RAG_Blob.md   Azure Sub-Plan 3 (RAG PDFs to Blob): design, steps, progress log
-├── scripts/  seed_admin_user.py  run_backend_dev.{sh,ps1}  run_frontend_dev.{sh,ps1}  verify_rag_data_blob.py (read-only blob vs local check)
+├── AdaptiveRAG_Azure_SubPlan4_RAG_AISearch.md   Azure Sub-Plan 4 (RAG PDFs indexed by Azure AI Search, retrieval from the index): design, decisions, steps, progress log
+├── azure/search/   index.json datasource.json skillset.json indexer.json (Azure AI Search definitions; the function key and subscription id are placeholders)
+├── azure_functions/rag_skills/   Azure Function app with the pdf-pages and embed custom skills (own tests and README)
+├── scripts/  seed_admin_user.py  run_backend_dev.{sh,ps1}  run_frontend_dev.{sh,ps1}  verify_rag_data_blob.py (read-only blob vs local check)  seed_search_from_chroma.py  compare_retrieval_backends.py  verify_search_index.py
 ├── backend/
 │   ├── .env (not committed)  .env.example  pyproject.toml  requirements/{base,backend,dev}.txt
 │   ├── app/
@@ -97,7 +109,7 @@ AdaptiveRAG/
 │   │   ├── agent/  state.py schemas.py prompts.py llm.py router.py graph.py checkpointer.py debug_utils.py
 │   │   │   ├── nodes/      rag_nodes.py sql_agent_node.py web_search_node.py code_execution_node.py
 │   │   │   ├── tools/      doc_tools.py sql_tools.py web_tools.py code_tools.py foundry_web_search.py
-│   │   │   └── retrieval/  vectorstore.py filters.py ranking.py ingestion.py
+│   │   │   └── retrieval/  vectorstore.py azure_search_store.py filters.py ranking.py ingestion.py
 │   │   ├── api/routers/    auth.py conversations.py chat.py media.py health.py admin.py
 │   │   ├── api/schemas/    auth.py conversation.py chat.py admin.py
 │   │   ├── auth/           security.py oauth2.py
@@ -225,6 +237,9 @@ Azure keys (Sub-Plan 1): `AZURE_STORAGE_ACCOUNT_NAME` (optional at startup, need
 `CODE_DATA_MAX_UPLOAD_MB` (default 50). Auth is `DefaultAzureCredential` (`az login` locally); no keys or connection strings.
 Sub-Plan 3 adds `AZURE_STORAGE_RAG_CONTAINER` (default `rag`), `AZURE_STORAGE_RAG_DATA_PREFIX` (default `rag_data/`) and
 `RAG_DATA_MAX_UPLOAD_MB` (default 20) on the same account; `RAG_DATA_DIR` stays until the local PDFs are retired.
+Sub-Plan 4 adds `RETRIEVAL_BACKEND` (`chroma` or `azure`; the code default is `chroma`, the real `.env` uses `azure`), `AZURE_SEARCH_ENDPOINT`
+(optional at startup), `AZURE_SEARCH_INDEX_NAME` (default `idx-adaptiverag-trial`), `AZURE_SEARCH_KEYWORD_MODE` (`hard` or `hybrid`, default
+`hard`) and `AZURE_SEARCH_EXHAUSTIVE` (default false). Auth is `DefaultAzureCredential` (role Search Index Data Reader).
 Foundry keys (Sub-Plan 2, all optional): `FOUNDRY_PROJECT_ENDPOINT` (blank means DuckDuckGo only), `FOUNDRY_WEB_SEARCH_AGENT_NAME`
 (default `adaptiverag-websearch`), `FOUNDRY_REQUEST_TIMEOUT_SECONDS` (default 45; `.env` uses 40),
 `WEB_SEARCH_FALLBACK_ENABLED` (default true). The real `.env` holds the endpoint; `.env.example` leaves it blank.
@@ -246,7 +261,9 @@ stale and fails because `send_message` now returns a tuple).
   wall-clock deadline), `test_web_search_node.py` (Foundry success, failure with and without fallback, not configured, the
   DuckDuckGo helper failing) and `test_web_tools.py` (`ddgs` exceptions, empty results, formatting), all with fakes.
   The suite stood at 144 passed at the end of Sub-Plan 2, and at 226 passed after Sub-Plan 3 Step 4 (71 new `rag_data_store`
-  unit tests and 12 new RAG upload endpoint tests, replacing one old test).
+  unit tests and 12 new RAG upload endpoint tests, replacing one old test). It stands at 292 passed after Sub-Plan 4 Step 13 (new: the
+  `azure_search_store` unit tests, the backend switch in `doc_tools`, `verify_search_index`, and a parity test between the Function's file-name
+  parser and `rag_data_store.parse_filename`; the Function app has its own 50 tests in `azure_functions/rag_skills/tests`).
 - Never run in tests: live Gemini, E2B, DuckDuckGo, Azure, Foundry, docling ingestion, the real `app.db` or `data/` folders.
 - The suite passed at the end of the original plan's point 9; the Phase 2 tests were added afterwards.
 - Not covered by automated tests: the `/media` endpoint and the chart-filename extraction in `chat_service`.
@@ -318,9 +335,14 @@ stale and fails because `send_message` now returns a tuple).
 - **RAG re-upload:** a corrected version of an already-ingested filing gets a different hash and is added alongside the
   old chunks rather than replacing them. There is no delete or replace flow for ingested documents. (Since Sub-Plan 3 this concerns
   only the existing Chroma index: a re-upload of the same company, type and period overwrites the blob and nothing is ingested.)
-- **New RAG uploads are not searchable (since Sub-Plan 3):** an uploaded filing is only stored in Blob Storage, while chat retrieval
-  uses the local Chroma index, which is frozen at the 20 PDFs ingested earlier. The Azure AI Search sub-plan is meant to close this.
-  The app can list, download and upload RAG blobs but not delete them.
+- **New RAG uploads (since Sub-Plan 4):** an uploaded filing is searchable in `azure` mode after the next indexer run (daily schedule `PT24H`;
+  run the indexer in the portal for an immediate result). In `chroma` mode it is not searchable. The app can list, download and upload RAG
+  blobs but not delete them; deleting a blob removes its pages at the next run, within the 7-day soft-delete retention.
+- **Duplicate-content protection (open):** the Chroma `file_hash` check does not exist in `azure` mode. The indexer keys on the blob path, so
+  the same content under another name is indexed twice. Options: an Admin upload check with the blob MD5, a `file_hash` index field with a
+  report script, or both.
+- **Partial index (Free tier):** while the index holds only some of the filings, questions about the others find nothing in `azure` mode, and
+  such a question runs the whole rewrite loop (about 3.5 minutes; the chat timeout is 300 s). Ideas are in section 6 of the Sub-Plan 4 file.
 - **First-user race:** two simultaneous registrations on an empty DB could both become admin (accepted for an internal tool).
 - **Validation is keyword-based:** `validate_sql_query` rejects non-SELECT and a list of dangerous keywords. It is not a
   read-only connection.
@@ -365,6 +387,10 @@ These are facts about the current code that a deployment design must account for
   project. The worst-case chat turn for a web question is about 104 s (router 2.4 s + Foundry limit 40 s + DuckDuckGo fallback
   about 61 s), under the frontend's 120 s limit, so a proxy in front must allow at least that.
 - **Azure access (Sub-Plan 3):** the same identity and role as Sub-Plan 1, on the second container (`rag`).
+- **Azure access (Sub-Plan 4):** when hosted in Azure, the managed identity also needs **Search Index Data Reader** on the search service. The search
+  service's own identity has **Storage Blob Data Reader** on the storage account; the Function app's identity has **Storage Blob Data Reader**
+  there and **Cognitive Services User** on the Document Intelligence resource. The Gemini key for the `embed` skill is an application setting of
+  the Function app (Key Vault later); the function key is pasted into the skillset in the portal only.
 - **(open question)** Which hosting target and process model to use, and whether SQLite stays or moves to a server DB.
 - **(open question)** Where persistent data (`storage/`, `data/`) lives and how it is backed up.
 - **(open question)** Whether a reverse proxy/TLS, health-check wiring (`/health`, `/readiness` exist) and CI are wanted.
@@ -381,16 +407,19 @@ These are facts about the current code that a deployment design must account for
 
 ---
 
-## 16. Azure deployment progress (updated 2026-11-03)
+## 16. Azure deployment progress (updated 2026-11-18)
 
-The move to Azure is incremental: one sub-plan at a time, each with its own `.md` file and checklist. Whether the whole
-project moves to Azure is decided later. Work happens in `D:\CVProjects\AdaptiveRAGAz`.
+The move to Azure is incremental: one sub-plan at a time, each with its own `.md` file and checklist. The aim (2026-11-17) is to
+run all sub-agent operations (RAG, SQL, code generation, web search) in the cloud. Work happens in `D:\CVProjects\AdaptiveRAGAz`.
 
 **Azure resources** (created in the Portal; the subscription already existed): resource group `rg-adaptiverag`,
 storage account `stadaptiverag32` (hierarchical namespace off), private container `code-execution`, datasets as blobs under
 the virtual folder `code_data/`. For Sub-Plan 2: Foundry resource `fn-adaptiverag`, project `proj-adaptiverag`, agent
 `adaptiverag-websearch` (model deployment `gpt-5.4`, built-in Web Search tool, instructions kept in Foundry). For Sub-Plan 3: private
-container `rag` in the same storage account, blobs under `rag_data/{amazon,apple,google}/` (one PDF each for now).
+container `rag` in the same storage account, blobs under `rag_data/{amazon,apple,google}/` (one PDF each for now). For Sub-Plan 4: AI Search service `as-adaptiverag-free` (Free tier, Central US)
+with index `idx-adaptiverag-trial`, a data source on the `rag` container, skillset `ss-adaptiverag-rag` and indexer `ixr-adaptiverag-rag`; Function app
+`func-adaptiverag-skills` (Flex Consumption, Python 3.11, East US 2) with its own storage account `stfuncadaptiverag32`; Document Intelligence
+`di-adaptiverag` (S0, East US 2).
 
 **Still on local disk for now:** `app.db`, `checkpoints.db`, the Chroma index, the employee DB, the local `data/rag_data/` PDF copies
 (no longer read by the app) and `storage/media/` chart files.
@@ -489,11 +518,34 @@ after the uploads (nothing ingested); an Amazon 2023 chat question was still ans
 local `data/rag_data` folder and `rag_data_dir`); `test_services_manual.py` is stale (it treats the `send_message` tuple as a message);
 `chroma.sqlite3` (Git LFS) shows as modified whenever the app has opened it, so leave it out of commits.
 
-**Next:** Sub-Plan 4 (Azure AI Search: data source, index, skillset and indexer on the `rag`
-container, retrieval switched from Chroma, then `ingestion.py`, docling and the Chroma folder retired).
+**Next:** Sub-Plan 4 (done up to the cutover, see below).
+
+### Sub-Plan 4: Azure AI Search for the RAG PDFs (Steps 1 to 11, 13 and 15 complete, 2026-11-18; Step 14 deferred, Step 12 optional)
+
+Plan and progress log: `AdaptiveRAG_Azure_SubPlan4_RAG_AISearch.md`.
+
+- **Retrieval:** `retrieval/azure_search_store.py` (`search_docs_azure`, same arguments and result type as Chroma's `search_docs`: filter on company, type,
+  year and quarter, vector query plus keywords, mode `hard` by default) and the backend switch in `tools/doc_tools.py`. The filters, the BM25 re-rank and
+  the tool output format are unchanged; the Chroma `search_docs` stays, so going back is the setting `RETRIEVAL_BACKEND=chroma`.
+- **Ingestion:** `azure_functions/rag_skills/` holds the `pdf-pages` skill (Document Intelligence layout model, markdown, one text per page, empty pages
+  skipped with real page numbers kept, long files analysed in parallel page ranges) and the `embed` skill (Gemini `gemini-embedding-001`, retrieval-document
+  task type, 3072 numbers). `azure/search/` holds the index (10 fields, one document per page, cosine, vector not stored), the data source (managed
+  identity, native blob soft delete tracking), the skillset and the indexer (on a `PT24H` schedule). Skill outputs are named `parsed_*` so they do not
+  collide with the blob metadata the Admin upload writes.
+- **Verified behaviour:** a re-uploaded PDF replaces its pages; a new file name is a new document; deleting a blob removes its pages at the next run; a run
+  with no change processes nothing; an upload from the Admin page is indexed by a scheduled run with no manual step.
+- **Results:** 293 page documents (Amazon 10-K 2023 93 pages with the empty page 79 missing, Apple 10-K 2023 80, Apple 8-K Q4 2023 9, Google 10-K 2023 111).
+  Against Chroma, 2 to 4 of the final 5 pages were shared; Chroma's final pages were always among Azure's candidates. 292 tests pass.
+- **Step 13 fix:** a question that matches nothing used to time out in the UI; grading of an empty result is now skipped and the chat timeout is 300 s
+  (the fixed not-found reply still takes about 3.5 minutes because of the rewrite loop).
+- **Open items:** Step 14 (retire `ingestion.py`, docling, `langchain-chroma`, the Chroma folder and the local `rag_data`, after approval); Step 12 (a paid
+  search service for all 20 PDFs, only if the Free tier is outgrown); duplicate-content protection; the remaining 17 PDFs (Sub-Plan 3 Step 6b) copied as needed;
+  the slow no-result question; saving `datasource.json` with the subscription id left as a placeholder.
 
 ### Git repository for the Azure working copy (2026-10-07)
 Pushed to `https://github.com/joydeep-ganguly/AdaptiveRAGAz.git`, branch `main`, commit `1c940b6`; details in section 11. Later commits
 keep `app.db` and `checkpoints.db` out (they are ignored), and `git status` should be checked for `.env` files before each push.
 
-**Next:** Sub-Plan 4: Azure AI Search for the RAG PDFs, then the deferred Step 6b of Sub-Plan 3. No other sub-plans are defined yet.
+**Next:** the retirement of the Chroma pieces (Sub-Plan 4 Step 14, after approval), the optional paid search service (Step 12), the deferred Step 6b of
+Sub-Plan 3 as PDFs are needed, and sub-plans for the SQL agent, the code agent and the hosting of the backend and frontend (the aim is to run all
+sub-agents in the cloud). None of those are defined yet.

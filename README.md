@@ -33,6 +33,10 @@ never directly to the database, the agent, or any external API.
 Web questions go to the Microsoft Foundry agent `adaptiverag-websearch` (the diagram's
 DuckDuckGo box is now the fallback, used when Foundry is not configured or fails).
 
+Filing questions are answered from an Azure AI Search index when `RETRIEVAL_BACKEND=azure` (the diagram's
+Chroma box is the local fallback, selected with `RETRIEVAL_BACKEND=chroma`). PDFs in Blob Storage are indexed
+by an Azure AI Search indexer through two custom skills in an Azure Function (see "Azure AI Search" below).
+
 ## Prerequisites
 
 - Python 3.10+
@@ -41,6 +45,10 @@ DuckDuckGo box is now the fallback, used when Foundry is not configured or fails
 - An Azure Storage account with private blob containers that hold the code-execution
   datasets and the RAG filing PDFs, the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli)
   (`az login`), and the **Storage Blob Data Contributor** role on that account
+- For filing retrieval from Azure: an Azure AI Search service with the index, data source, skillset and
+  indexer from `azure/search/`, the Function app from `azure_functions/rag_skills/` and a Document
+  Intelligence resource (see "Azure AI Search" below), and the **Search Index Data Reader** role on the
+  search service. Without them set `RETRIEVAL_BACKEND=chroma`.
 - Optional, for web search through Microsoft Foundry: a Foundry project with an agent named
   `adaptiverag-websearch` that has the built-in Web Search tool, and the **Foundry User**
   role on that project. Without it, web questions are answered through DuckDuckGo only.
@@ -107,12 +115,38 @@ company, named from the upload form fields:
 | `RAG_DATA_MAX_UPLOAD_MB` | `20` | Largest PDF the Admin page accepts |
 
 The Admin upload only **stores** the PDF (its company, type, year and quarter are also
-written as blob metadata). It does not index it: indexing into a search index is planned
-as a separate step in Azure, so for now chat answers about filings come from the
-existing local Chroma index and a newly uploaded filing is not searchable yet.
+written as blob metadata). Azure AI Search indexes it at its next indexer run (see the next
+section), so a new filing is searchable in chat after that run.
 
 The backend starts without Azure configured; only the code-execution agent and the
 Admin uploads report an error until it is.
+
+#### Azure AI Search (RAG filings)
+
+Chat answers about filings are retrieved from an Azure AI Search index: one search document per PDF
+page, holding the page text, a Gemini embedding and the company, document type, year, quarter and page
+number. `RETRIEVAL_BACKEND` chooses the source: `azure`, or `chroma` (the old local index, kept as a
+fallback; it is also the default when the setting is absent). Sign in with `az login`; your identity
+needs the **Search Index Data Reader** role on the search service.
+
+| `.env` setting | Default | Meaning |
+|---|---|---|
+| `RETRIEVAL_BACKEND` | `chroma` | `azure` reads from Azure AI Search, `chroma` from the local index |
+| `AZURE_SEARCH_ENDPOINT` | blank | `https://<service>.search.windows.net` |
+| `AZURE_SEARCH_INDEX_NAME` | `idx-adaptiverag-trial` | Index to query |
+| `AZURE_SEARCH_KEYWORD_MODE` | `hard` | `hard`: a page must contain at least one ranking keyword; `hybrid`: keywords only add to the score |
+| `AZURE_SEARCH_EXHAUSTIVE` | `false` | Exhaustive vector search instead of the approximate one |
+
+How a PDF becomes searchable: the PDF is in Blob Storage; an Azure AI Search indexer
+(`ixr-adaptiverag-rag`, scheduled every 24 hours, or run on demand in the portal) calls the `pdf-pages`
+skill of the Azure Function app in `azure_functions/rag_skills/` (Document Intelligence turns the PDF into
+one markdown text per page; company, type, year and quarter come from the file name) and its `embed` skill
+(Gemini `gemini-embedding-001`), then writes the pages to the index. Changing a PDF re-indexes it, and
+deleting its blob removes its pages at the next run (blob soft delete tracking). The definitions of the
+index, data source, skillset and indexer are in `azure/search/` (the function key and the subscription id
+are placeholders there). `scripts/verify_search_index.py` checks the index against the expected page
+counts and runs sample questions. While the index holds only some of the filings, questions about the
+others find nothing in `azure` mode; `RETRIEVAL_BACKEND=chroma` brings them back.
 
 #### Foundry web-search agent (web search)
 
@@ -192,9 +226,9 @@ If you're an admin, an **Admin** page appears in the sidebar:
 - Upload a financial filing PDF (up to 20 MB by default) to Azure Blob Storage. You'll
   provide the company name, document type, fiscal year, and (for quarterly filings) the
   fiscal quarter; the file is stored as `{company}/{company} {doc_type} [{quarter}] {year}.pdf`,
-  and uploading the same company, type and period again overwrites it. The upload does
-  not index the filing, so it is not searchable in chat yet (see the Azure Blob Storage
-  section).
+  and uploading the same company, type and period again overwrites it. The upload only
+  stores the filing; it becomes searchable in chat after the next Azure AI Search indexer run (see the
+  Azure AI Search section).
 
 ## Running tests
 
@@ -223,3 +257,6 @@ database/data folders — safe to run anytime.
 - `AdaptiveRAG_Azure_SubPlan3_RAG_Blob.md` — moving the RAG filing PDFs from the local
   `data/rag_data` folder to Azure Blob Storage (the upload only stores the file; indexing
   is a later step): design, steps and progress log.
+- `AdaptiveRAG_Azure_SubPlan4_RAG_AISearch.md` — indexing the RAG filing PDFs with Azure AI Search
+  (Document Intelligence and Gemini embeddings through an Azure Function) and reading chat retrieval from
+  the index, with Chroma kept as a switchable fallback: design, decisions, steps and progress log.
