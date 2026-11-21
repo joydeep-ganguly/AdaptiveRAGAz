@@ -100,6 +100,37 @@ class Settings(BaseSettings):
     web_search_fallback_enabled: bool = True
 
     # ------------------------------------------------------------------ #
+    # Scaling layer (app/scaling/). OFF by default: with scaling_enabled=false
+    # the app behaves exactly as before — synchronous /chat/query, no Redis,
+    # no worker. Turn it on only for the queue-based deployment profile.
+    # ------------------------------------------------------------------ #
+    scaling_enabled: bool = False
+    redis_url: str = "redis://localhost:6379/0"
+
+    # Queue: jobs waiting beyond this depth are rejected (load shedding)
+    scaling_queue_max_depth: int = 200
+    scaling_job_result_ttl_seconds: int = 3600
+
+    # Per-user token bucket: burst size, and how many requests are refilled per second
+    scaling_rate_limit_capacity: int = 10
+    scaling_rate_limit_refill_per_second: float = 0.5
+
+    # Idempotency keys and answer cache
+    scaling_idempotency_ttl_seconds: int = 86400
+    scaling_cache_ttl_seconds: int = 3600
+
+    # LLM token budgets: per request, per user per day, and the cap on the
+    # grade -> rewrite -> retrieve loop inside one request
+    scaling_max_tokens_per_request: int = 50000
+    scaling_max_tokens_per_user_per_day: int = 500000
+    scaling_max_rewrites_per_request: int = 2
+
+    # Retries on model and search calls: exponential backoff with jitter
+    scaling_retry_max_attempts: int = 4
+    scaling_retry_base_delay_seconds: float = 1.0
+    scaling_retry_max_delay_seconds: float = 20.0
+
+    # ------------------------------------------------------------------ #
     # Misc
     # ------------------------------------------------------------------ #
     debug_mode: bool = False
