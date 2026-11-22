@@ -1,4 +1,6 @@
 -r backend.txt
+-r scaling.txt
 pytest
 pytest-mock
 pytest-cov
+fakeredis
