@@ -33,3 +33,11 @@ app.include_router(admin.router)
 app.include_router(conversations.router)
 app.include_router(chat.router)
 app.include_router(media.router)
+
+
+# Scaling layer: mounted only when SCALING_ENABLED=true. The import sits inside
+# the if on purpose, so the small setup never loads the scaling package or needs Redis.
+if get_settings().scaling_enabled:
+    from app.scaling.router import router as scaling_router
+
+    app.include_router(scaling_router)
