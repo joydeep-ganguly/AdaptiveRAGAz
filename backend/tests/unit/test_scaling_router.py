@@ -10,7 +10,8 @@ from app.db import crud
 from app.db.session import get_db_session
 from app.deps import get_current_user
 from app.main import app as main_app
-from app.scaling.router import get_job_store, router
+from app.scaling.rate_limit import RateLimiter
+from app.scaling.router import get_job_store, get_max_queue_depth, get_rate_limiter, router
 
 
 @pytest.fixture()
@@ -27,13 +28,15 @@ class SimpleUsers:
 
 
 @pytest.fixture()
-def scaling_client(db_session, job_store, users):
+def scaling_client(db_session, job_store, rate_limiter, users):
     """A tiny app that mounts ONLY the scaling router, with the database,
-    job store and login swapped for test doubles. Logged in as alice by default."""
+    job store, limits and login swapped for test doubles. Logged in as alice by default."""
     test_app = FastAPI()
     test_app.include_router(router)
     test_app.dependency_overrides[get_db_session] = lambda: db_session
     test_app.dependency_overrides[get_job_store] = lambda: job_store
+    test_app.dependency_overrides[get_rate_limiter] = lambda: rate_limiter
+    test_app.dependency_overrides[get_max_queue_depth] = lambda: 1000
     test_app.dependency_overrides[get_current_user] = lambda: users.alice
     return TestClient(test_app)
 
@@ -136,3 +139,46 @@ def test_job_routes_are_absent_when_scaling_is_disabled():
     assert "/chat/{conversation_id}/query" in paths  # the plain endpoint is still there
     assert "/chat/jobs/{job_id}" not in paths
     assert "/chat/{conversation_id}/jobs" not in paths
+
+
+def test_submit_is_rate_limited_with_429_and_retry_after(scaling_client, db_session, job_store, users, fake_redis):
+    scaling_client.app.dependency_overrides[get_rate_limiter] = lambda: RateLimiter(
+        fake_redis, capacity=2, refill_per_second=0.5
+    )
+    conversation = crud.create_conversation(db_session, user_id=users.alice.id)
+    url = f"/chat/{conversation.id}/jobs"
+
+    assert scaling_client.post(url, json={"message": "one"}).status_code == 202
+    assert scaling_client.post(url, json={"message": "two"}).status_code == 202
+    response = scaling_client.post(url, json={"message": "three"})
+
+    assert response.status_code == 429
+    assert int(response.headers["Retry-After"]) >= 1
+    assert job_store.queue_depth() == 2  # the refused request was not queued
+
+
+def test_rate_limit_is_per_user(scaling_client, db_session, users, fake_redis):
+    scaling_client.app.dependency_overrides[get_rate_limiter] = lambda: RateLimiter(
+        fake_redis, capacity=1, refill_per_second=0.5
+    )
+    alice_url = f"/chat/{crud.create_conversation(db_session, user_id=users.alice.id).id}/jobs"
+    bob_url = f"/chat/{crud.create_conversation(db_session, user_id=users.bob.id).id}/jobs"
+
+    assert scaling_client.post(alice_url, json={"message": "one"}).status_code == 202
+    assert scaling_client.post(alice_url, json={"message": "two"}).status_code == 429
+
+    _login_as(scaling_client, users.bob)
+    assert scaling_client.post(bob_url, json={"message": "one"}).status_code == 202
+
+
+def test_submit_sheds_load_when_queue_is_full(scaling_client, db_session, job_store, users):
+    scaling_client.app.dependency_overrides[get_max_queue_depth] = lambda: 1
+    conversation = crud.create_conversation(db_session, user_id=users.alice.id)
+    url = f"/chat/{conversation.id}/jobs"
+
+    assert scaling_client.post(url, json={"message": "one"}).status_code == 202
+    response = scaling_client.post(url, json={"message": "two"})
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "5"
+    assert job_store.queue_depth() == 1  # the second job was not queued
