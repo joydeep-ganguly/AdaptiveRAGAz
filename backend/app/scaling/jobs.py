@@ -32,8 +32,10 @@ class JobStore:
     def _key(self, job_id: str) -> str:
         return f"{JOB_KEY_PREFIX}{job_id}"
 
-    def enqueue(self, user_id: int, conversation_id: str, message: str) -> str:
-        job_id = str(uuid.uuid4())
+    def enqueue(self, user_id: int, conversation_id: str, message: str, job_id: str | None = None) -> str:
+        # job_id can be supplied by the caller (the submit endpoint creates it
+        # before claiming an idempotency key); otherwise a new one is made.
+        job_id = job_id or str(uuid.uuid4())
         now = str(time.time())
 
         # One pipeline = one atomic transaction: the job record is guaranteed

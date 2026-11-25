@@ -37,9 +37,9 @@ Show how the agent is scaled for many concurrent users, and keep the scaling par
 |---|---|---|
 | 0 | Restore tag, branch, baseline tests (292 passed) | Done |
 | 1 | Scaling settings in `config.py` and `.env.example` (all off by default) | Done |
-| 2 | Queue and worker (submit, queue, work, poll) | In progress |
-| 3 | Per-user token-bucket rate limit (429 + `Retry-After`), bounded queue with load shedding | Not started |
-| 4 | Idempotency keys; cache for repeated questions and embeddings | Not started |
+| 2 | Queue and worker (submit, queue, work, poll) | Done |
+| 3 | Per-user token-bucket rate limit (429 + `Retry-After`), bounded queue with load shedding | Done |
+| 4 | Idempotency keys; caches for embeddings and repeated LLM calls | Done |
 | 5 | Token budgets per request and per user; cap on the grade/rewrite loop | Not started |
 | 6 | Retries with exponential backoff and jitter on model and search calls | Not started |
 | 7 | Observability: latency, queue depth, 429 rate, tokens per request | Not started |
@@ -53,18 +53,50 @@ Show how the agent is scaled for many concurrent users, and keep the scaling par
 | Sub-step | What | Files | Status |
 |---|---|---|---|
 | 2a | Dependencies (`redis`, `fakeredis`) and Docker available | `requirements/scaling.txt`, `requirements/dev.txt` | Done |
-| 2b | Redis connection and job store; start local Redis | `app/scaling/redis_client.py`, `jobs.py` | Next |
-| 2c | Worker process (`python -m app.scaling.worker`) | `app/scaling/worker.py` | Not started |
-| 2d | Router and schemas, mounted in `main.py` only when scaling is enabled | `app/scaling/router.py`, `schemas.py`, `main.py` | Not started |
-| 2e | Unit tests with fake Redis; real end-to-end run | `tests/unit/scaling/` | Not started |
+| 2b | Redis connection and job store; start local Redis | `app/scaling/redis_client.py`, `jobs.py` | Done |
+| 2c | Worker process (`python -m app.scaling.worker`) | `app/scaling/worker.py` | Done |
+| 2d | Router and schemas, mounted in `main.py` only when scaling is enabled | `app/scaling/router.py`, `schemas.py`, `main.py` | Done |
+| 2e | Unit tests with fake Redis (21 tests); real end-to-end run done in 2d | `tests/unit/conftest.py`, `test_scaling_jobs.py`, `test_scaling_worker.py`, `test_scaling_router.py` | Done |
 
 Design notes for Step 2:
 - Submit: `POST /chat/{conversation_id}/jobs` checks ownership, enqueues, returns `202` with `job_id`.
 - Poll: `GET /chat/jobs/{job_id}` returns `queued | running | succeeded | failed` and the answer; only the owner can read a job.
 - Jobs are Redis hashes with an expiry; the queue is a Redis list.
 - One worker only until Step 8 (SQLite cannot handle several writer processes).
+- Test note: this FastAPI version lists included routers as wrapper objects on `app.routes`, so route checks use `app.openapi()["paths"]`.
 - Known gap to address and document: two jobs on the same conversation at once would race on the same LangGraph thread; needs a per-conversation lock.
 - Known gap to document: a job being worked on is lost if the worker dies mid-job; a processing list with a visibility timeout is the production answer.
+
+### Step 3 detail
+
+| Sub-step | What | Files | Status |
+|---|---|---|---|
+| 3a | Token-bucket limiter as one atomic Lua script in Redis; 5 unit tests (needs `fakeredis[lua]`); checked on real Redis | `app/scaling/rate_limit.py`, `tests/unit/test_scaling_rate_limit.py` | Done |
+| 3b | Wired into `POST /chat/{id}/jobs`: 429 + `Retry-After` per user, 503 + `Retry-After` when the queue is full; 3 router tests; real burst check | `app/scaling/router.py`, tests | Done |
+
+Order of checks on submit, cheapest first: rate limit, then queue depth, then database ownership check, then enqueue.
+
+Real burst check (queue limit 5, bucket 10, no worker): requests 1-5 got 202, 6-10 got 503 (`Retry-After: 5`), 11-15 got 429 (`Retry-After: 2`).
+
+Design notes for Step 3:
+- A request refused with 503 still uses a rate-limit token. The limiter measures what a user sends, not what is accepted.
+- The queue depth check is approximate: a few extra jobs can slip in while requests race. An atomic version is a small Lua script.
+- Polling (`GET /chat/jobs/{id}`) has no limit of its own yet. To address in the architecture doc (caching, SSE, or its own bucket).
+- Redis errors on submit return 503 "Queue unavailable".
+
+### Step 4 detail
+
+| Sub-step | What | Files | Status |
+|---|---|---|---|
+| 4a | Idempotency keys on submit (`Idempotency-Key` header); 14 new tests; real check: 3 requests, 1 job queued | `app/scaling/idempotency.py`, `jobs.py`, `router.py`, tests | Done |
+| 4b | Embedding cache and LLM-response cache in Redis; 15 new tests; real check done (see results below) | `app/scaling/cache.py`, `app/agent/llm.py` (small hook), `worker.py`, tests | Done |
+
+Design notes for Step 4:
+- Idempotency: the key is scoped per user. A repeated key returns the original job id and does not consume a rate-limit token or queue a second job. The same key with a different message or conversation is rejected with 422. The key is claimed atomically (`SET NX`) so two simultaneous retries cannot both create a job.
+- Caching works at the level of single calls, not whole answers. A cached final answer would skip the LangGraph run, and the conversation memory (checkpoint) would then miss that turn, breaking follow-up questions. The LLM cache key is the full prompt (including the conversation so far), so a hit is always correct. Message and tool-call ids are removed before building the key, because they change on every run.
+- Both caches fail open: if Redis is down the real call is made and the question still works. The caches are active only when `SCALING_ENABLED=true` (the worker and the API both need the flag).
+- Hit and miss counts are kept in Redis (`cache_stats`) for the results table.
+- Expected hit pattern: an identical question in a new conversation hits on the early deterministic steps; the same question inside a long conversation usually misses because the history differs. State this honestly in the write-up.
 
 ## 5. Local environment notes
 
@@ -84,6 +116,17 @@ Design notes for Step 2:
 
 State clearly in the write-up which rows used stubs and which used real services (Free-tier AI Search and Gemini rate limits will throttle the real run).
 
+### Cache effect (real services, single user, 1 worker, 24-25 Nov 2026)
+
+Same question asked in two new conversations: "What is Amazon's revenue for the year 2023?" (document question over the indexed filings). The cache was cleared before the first run.
+
+| Run | Time | LLM cache | Embedding cache |
+|---|---|---|---|
+| 1 (cold) | 39.2 s | 0 hits, 7 misses | 0 hits, 1 miss |
+| 2 (repeat) | 0.6 s | 7 hits (total 7 hits, 7 misses) | 1 hit (total 1 hit, 1 miss) |
+
+Both runs returned the same answer. This is the best case: an identical question, no earlier conversation history, within the cache lifetime (`SCALING_CACHE_TTL_SECONDS`, 1 hour by default). A question asked inside a long conversation usually misses, because the prompt includes the history. This was one user and one worker, not a load test.
+
 ## 7. Change log
 
 | Date | Change |
@@ -91,3 +134,12 @@ State clearly in the write-up which rows used stubs and which used real services
 | 21 Nov 2026 | Plan agreed; Step 0 done (tag `pre-scaling-baseline`, branch `feature/scaling-layer`, 292 tests passing) |
 | 21 Nov 2026 | Step 1 done: scaling settings added, disabled by default; committed and pushed |
 | 22 Nov 2026 | Step 2a done: `redis` and `fakeredis` installed; Docker 29.8.0 available. Plan saved to this file |
+| 22 Nov 2026 | Step 2b done: Redis connection and `JobStore` (queue = Redis list, jobs = Redis hashes with expiry) |
+| 23 Nov 2026 | Step 2c done: worker (`python -m app.scaling.worker`) reuses `chat_service.send_message`; unexpected errors are logged, clients see a generic message |
+| 23 Nov 2026 | Step 2d done: `POST /chat/{id}/jobs` (202) and `GET /chat/jobs/{job_id}`; mounted only when `SCALING_ENABLED=true`; verified end to end with a real question and with the flag off |
+| 23 Nov 2026 | Step 2e done: 21 unit tests; full suite 313 passed |
+| 24 Nov 2026 | Step 3a done: per-user token bucket (Lua, atomic); suite 318 passed |
+| 24 Nov 2026 | Step 3b done: 429 rate limit and 503 load shedding on submit; real burst check matched; suite 321 passed. Step 3 complete |
+| 24 Nov 2026 | Step 4 started (idempotency keys, then caches) |
+| 24 Nov 2026 | Step 4a done: `Idempotency-Key` on submit (replay returns the original job, no rate-limit token used; same key with a different request gets 422; key released if queueing fails); suite 335 passed |
+| 25 Nov 2026 | Step 4b done: Redis embedding cache and LLM-response cache (fail open, enabled only with `SCALING_ENABLED=true`); suite 350 passed; repeat of a document question went from 39.2 s to 0.6 s with 7/7 LLM and 1/1 embedding hits. Step 4 complete |

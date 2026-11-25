@@ -63,6 +63,15 @@ def run_worker() -> None:
     settings = get_settings()
     settings.ensure_storage_dirs()
 
+    if settings.scaling_enabled:
+        from app.scaling.cache import install_llm_cache
+
+        install_llm_cache(get_redis(), settings.scaling_cache_ttl_seconds)
+        logger.info("LLM and embedding caches are on")
+    else:
+        logger.warning("SCALING_ENABLED is not true: LLM and embedding caches are off for this worker")
+
+
     graph = create_adaptive_rag()  # built once per worker process, like the API does at startup
     store = JobStore(get_redis(), settings.scaling_job_result_ttl_seconds)
 

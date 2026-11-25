@@ -3,6 +3,7 @@
 import fakeredis
 import pytest
 
+from app.scaling.idempotency import IdempotencyStore
 from app.scaling.jobs import JobStore
 from app.scaling.rate_limit import RateLimiter
 
@@ -23,3 +24,8 @@ def job_store(fake_redis):
 def rate_limiter(fake_redis):
     # Very generous by default, so tests that aren't about rate limiting never hit it.
     return RateLimiter(fake_redis, capacity=1000, refill_per_second=1000)
+
+
+@pytest.fixture()
+def idempotency_store(fake_redis):
+    return IdempotencyStore(fake_redis, ttl_seconds=3600)

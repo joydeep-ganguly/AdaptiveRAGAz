@@ -1,6 +1,7 @@
 from functools import lru_cache
 
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_core.embeddings import Embeddings
 
 from app.config import get_settings
 
@@ -39,6 +40,13 @@ def get_sql_llm() -> ChatGoogleGenerativeAI:
 
 
 @lru_cache
-def get_embeddings() -> GoogleGenerativeAIEmbeddings:
+def get_embeddings() -> Embeddings:
     settings = get_settings()
-    return GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL, google_api_key=settings.google_api_key)
+    embeddings = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL, google_api_key=settings.google_api_key)
+    if settings.scaling_enabled:
+        # Scale profile only: remember embeddings in Redis. Imported here so the
+        # small setup never loads the scaling package.
+        from app.scaling.cache import cached_embeddings
+
+        return cached_embeddings(embeddings)
+    return embeddings
