@@ -62,12 +62,18 @@ def get_search_client() -> SearchClient:
     settings = get_settings()
     if not settings.azure_search_endpoint:
         raise AzureSearchConfigError("AZURE_SEARCH_ENDPOINT is not set")
+    client_options = {}
+    if settings.scaling_enabled:
+        # Scale profile: Azure's default retry has no jitter and allows up to 10 retries.
+        from app.scaling.retries import search_retry_policy
+
+        client_options["retry_policy"] = search_retry_policy(settings)
     return SearchClient(
         endpoint=settings.azure_search_endpoint,
         index_name=settings.azure_search_index_name,
         credential=DefaultAzureCredential(),
+        **client_options,
     )
-
 
 def odata_string(value) -> str:
     """OData string literal: single-quoted, embedded quotes doubled."""

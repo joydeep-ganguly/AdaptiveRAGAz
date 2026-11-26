@@ -41,7 +41,7 @@ Show how the agent is scaled for many concurrent users, and keep the scaling par
 | 3 | Per-user token-bucket rate limit (429 + `Retry-After`), bounded queue with load shedding | Done |
 | 4 | Idempotency keys; caches for embeddings and repeated LLM calls | Done |
 | 5 | Token budgets per request and per user; cap on the grade/rewrite loop | Done |
-| 6 | Retries with exponential backoff and jitter on model and search calls | Not started |
+| 6 | Retries with exponential backoff and jitter on model and search calls | Done |
 | 7 | Observability: latency, queue depth, 429 rate, tokens per request | Not started |
 | 8 | Postgres support; `docker-compose.scale.yml` (API, Redis, workers, Postgres) | Not started |
 | 9 | Load tests (stubbed LLM/search first, then a small real-services run); results table | Not started |
@@ -111,6 +111,22 @@ Design notes for Step 5:
 - The plain profile keeps the original rewrite limit (`MAX_ITERATIONS = 3`); the scale profile uses `SCALING_MAX_REWRITES_PER_REQUEST`.
 - Limits of this design: only LangChain model calls are counted. The Foundry web-search agent tokens and embeddings are not counted. Daily limits reset at UTC midnight (05:30 IST), a simplification. The daily check on submit uses tokens already recorded, so jobs already in the queue can push a user slightly over. A budget-stopped job leaves the user's message saved without an assistant reply, like other failed jobs.
 
+### Step 6 detail
+
+| Sub-step | What | Files | Status |
+|---|---|---|---|
+| 6 | Retry layer for the scale profile: jittered backoff helper, retry wrapper for embeddings, jittered retry policy for Azure AI Search, attempt count for Gemini calls taken from settings; 28 new tests (suite 401 passed); real check done (see results below) | `app/scaling/retries.py`, `app/agent/llm.py`, `app/agent/retrieval/azure_search_store.py`, `tests/unit/test_scaling_retries.py` | Done |
+
+Design notes for Step 6:
+- Reading the libraries first changed the plan. Gemini chat calls already retry in the Google SDK (exponential backoff with jitter); the Azure SDK retries with exponential backoff but no jitter and up to 10 retries (waits up to 120 s); the Gemini embeddings client does not retry at all. A second retry layer on top of the Gemini one would multiply attempts (4 x 6), so it was not added.
+- What was added: `SCALING_RETRY_MAX_ATTEMPTS` is passed to the Gemini models as `max_retries` (it counts total attempts, including the first); a jittered policy for Azure AI Search with the same attempt limit; a retry wrapper for embeddings, placed outside the Redis cache so a cache hit never reaches it.
+- Full jitter: each wait is a random time between 0 and min(max delay, base x 2^n), so workers that fail together do not retry together.
+- Only transient errors are retried (408, 429, 500, 502, 503, 504, timeouts, dropped connections). Bad requests and authentication errors fail at once.
+- Foundry web search is deliberately not retried: it has a time limit and a DuckDuckGo fallback, and a retry would hold a worker longer.
+- All of it applies only when `SCALING_ENABLED=true`.
+- Not tested with real failures: the Gemini chat retries and the Azure Search policy were checked in unit tests and by a normal end-to-end question, not by causing real outages. The embeddings wrapper was checked against the real embeddings model with simulated 503 errors.
+- Library versions checked: `langchain-google-genai` 4.4.0, `google-genai` 2.28.0, `azure-core` 1.41.0, `azure-search-documents` 12.1.0.
+
 ## 5. Local environment notes
 
 - Start local Redis: `docker run -d --name redis-adaptive -p 6379:6379 redis:7`
@@ -152,6 +168,17 @@ Question: "What is Amazon's revenue for the year 2023?" (document question, cach
 
 A normal document question uses about 7 model calls and 18,000 tokens, mostly because prompts carry the retrieved passages. The per-request default is set to about 3x that (60,000 tokens); the per-call default of 20 is about 3x the 7 calls. These are single-question measurements, not an average over many questions.
 
+### Retry check (real embeddings model, simulated outage, 26 Nov 2026)
+
+First calls made to fail with a simulated 503; settings: 4 attempts, base 1.0 s, max 20 s.
+
+| Case | Calls | Waits before retries | Outcome |
+|---|---|---|---|
+| 2 failures, then the real service answers | 3 | 0.6 s, 1.1 s | Succeeded (3072-number vector) in 2.7 s |
+| Service stays down | 4 | 0.9 s, 0.3 s, 0.9 s | Gave up, error raised to the caller, 2.1 s |
+
+The waits are random each time (jitter), so a repeat run shows different numbers. After the retry layer was added, one normal document question still succeeded: 7 model calls, 21,640 tokens, 78.2 s (the earlier run took 42.6 s with 17,999 tokens; the answer text differs, and Gemini latency varies between runs, so this is not read as an effect of the retry layer).
+
 ## 7. Change log
 
 | Date | Change |
@@ -170,3 +197,4 @@ A normal document question uses about 7 model calls and 18,000 tokens, mostly be
 | 25 Nov 2026 | Step 4b done: Redis embedding cache and LLM-response cache (fail open, enabled only with `SCALING_ENABLED=true`); suite 350 passed; repeat of a document question went from 39.2 s to 0.6 s with 7/7 LLM and 1/1 embedding hits. Step 4 complete |
 | 26 Nov 2026 | Step 5a done: token ledger, budget callback and graph wrapper (cached calls cost 0 tokens); suite 360 passed |
 | 26 Nov 2026 | Step 5b done: per-request token and call limits in the worker, daily token budget with 429 on submit, rewrite cap in the scale profile, usage shown on the job; suite 373 passed. Real check: 7 calls and 17,999 tokens for a normal question; per-question and daily limits both enforced. Per-request default raised from 50,000 to 60,000 tokens. Step 5 complete |
+| 26 Nov 2026 | Step 6 done: retry layer for the scale profile (jittered backoff; embeddings wrapper; jittered Azure Search policy; Gemini attempt count from settings; Foundry web search deliberately not retried); suite 401 passed; embeddings retry checked against the real model with simulated 503 errors; a normal question still succeeds end to end |
