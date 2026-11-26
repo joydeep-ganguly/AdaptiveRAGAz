@@ -82,7 +82,12 @@ def _generation_to_json(generation) -> dict:
 
 def _generation_from_json(data: dict):
     if data["kind"] == "chat":
-        return ChatGeneration(message=_load_message(data["message"]), generation_info=data.get("info"))
+        message = _load_message(data["message"])
+        # A cached answer costs no tokens now, so the original usage must not be
+        # counted again by the token budgets.
+        if getattr(message, "usage_metadata", None):
+            message.usage_metadata = None
+        return ChatGeneration(message=message, generation_info=data.get("info"))
     return Generation(text=data["text"], generation_info=data.get("info"))
 
 
