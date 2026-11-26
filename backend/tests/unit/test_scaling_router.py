@@ -10,6 +10,7 @@ from app.db import crud
 from app.db.session import get_db_session
 from app.deps import get_current_user
 from app.main import app as main_app
+from app.scaling.budgets import UserTokenLedger
 from app.scaling.jobs import JOB_KEY_PREFIX
 from app.scaling.rate_limit import RateLimiter
 from app.scaling.router import (
@@ -17,6 +18,7 @@ from app.scaling.router import (
     get_job_store,
     get_max_queue_depth,
     get_rate_limiter,
+    get_token_ledger,
     router,
 )
 
@@ -35,7 +37,7 @@ class SimpleUsers:
 
 
 @pytest.fixture()
-def scaling_client(db_session, job_store, rate_limiter, idempotency_store, users):
+def scaling_client(db_session, job_store, rate_limiter, idempotency_store, token_ledger, users):
     """A tiny app that mounts ONLY the scaling router, with the database,
     job store, limits and login swapped for test doubles. Logged in as alice by default."""
     test_app = FastAPI()
@@ -44,6 +46,7 @@ def scaling_client(db_session, job_store, rate_limiter, idempotency_store, users
     test_app.dependency_overrides[get_job_store] = lambda: job_store
     test_app.dependency_overrides[get_rate_limiter] = lambda: rate_limiter
     test_app.dependency_overrides[get_idempotency_store] = lambda: idempotency_store
+    test_app.dependency_overrides[get_token_ledger] = lambda: token_ledger    
     test_app.dependency_overrides[get_max_queue_depth] = lambda: 1000
     test_app.dependency_overrides[get_current_user] = lambda: users.alice
     return TestClient(test_app)
@@ -297,3 +300,44 @@ def test_submit_sheds_load_when_queue_is_full(scaling_client, db_session, job_st
     assert response.status_code == 503
     assert response.headers["Retry-After"] == "5"
     assert job_store.queue_depth() == 1  # the second job was not queued
+
+
+def test_submit_is_refused_when_the_daily_token_budget_is_used_up(scaling_client, db_session, job_store, users, fake_redis):
+    ledger = UserTokenLedger(fake_redis, daily_limit=100)
+    ledger.add(users.alice.id, 100)
+    scaling_client.app.dependency_overrides[get_token_ledger] = lambda: ledger
+    conversation = crud.create_conversation(db_session, user_id=users.alice.id)
+
+    response = scaling_client.post(f"/chat/{conversation.id}/jobs", json={"message": "hello"})
+
+    assert response.status_code == 429
+    assert 1 <= int(response.headers["Retry-After"]) <= 24 * 3600
+    assert "Daily usage limit" in response.json()["detail"]
+    assert job_store.queue_depth() == 0
+
+
+def test_daily_budget_is_per_user(scaling_client, db_session, users, fake_redis):
+    ledger = UserTokenLedger(fake_redis, daily_limit=100)
+    ledger.add(users.alice.id, 100)  # alice is out, bob is not
+    scaling_client.app.dependency_overrides[get_token_ledger] = lambda: ledger
+    bob_url = f"/chat/{crud.create_conversation(db_session, user_id=users.bob.id).id}/jobs"
+
+    _login_as(scaling_client, users.bob)
+
+    assert scaling_client.post(bob_url, json={"message": "hello"}).status_code == 202
+
+
+def test_get_job_returns_usage_when_recorded(scaling_client, job_store, users):
+    job_id = job_store.enqueue(users.alice.id, "c1", "hello")
+    job_store.mark_failed(job_id, "limit", usage={"tokens": 120, "llm_calls": 3})
+
+    body = scaling_client.get(f"/chat/jobs/{job_id}").json()
+
+    assert body["usage"] == {"tokens": 120, "llm_calls": 3}
+
+
+def test_get_job_has_no_usage_before_it_finishes(scaling_client, job_store, users):
+    job_id = job_store.enqueue(users.alice.id, "c1", "hello")
+
+    assert scaling_client.get(f"/chat/jobs/{job_id}").json()["usage"] is None
+

@@ -20,6 +20,7 @@ inside Azure and is not visible here; embeddings are not counted (very small).
 
 import logging
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from langchain_core.callbacks import BaseCallbackHandler
@@ -82,6 +83,15 @@ class UserTokenLedger:
         now = datetime.now(timezone.utc)
         tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         return max(1, int((tomorrow - now).total_seconds()))
+
+
+@dataclass(frozen=True)
+class BudgetLimits:
+    """Everything the worker needs to budget one job."""
+
+    ledger: UserTokenLedger
+    max_tokens: int
+    max_llm_calls: int
 
 
 def _tokens_in(response) -> int:

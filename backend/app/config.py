@@ -121,9 +121,10 @@ class Settings(BaseSettings):
 
     # LLM token budgets: per request, per user per day, and the cap on the
     # grade -> rewrite -> retrieve loop inside one request
-    scaling_max_tokens_per_request: int = 50000
+    scaling_max_tokens_per_request: int = 60000
     scaling_max_tokens_per_user_per_day: int = 500000
     scaling_max_rewrites_per_request: int = 2
+    scaling_max_llm_calls_per_request: int = 20  # a normal RAG question uses about 7
 
     # Retries on model and search calls: exponential backoff with jitter
     scaling_retry_max_attempts: int = 4

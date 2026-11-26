@@ -7,10 +7,10 @@ POST /chat/{conversation_id}/jobs  -> 202 + job_id (returns immediately)
 GET  /chat/jobs/{job_id}           -> status, and the answer once finished
 
 Submissions are handled in this order, cheapest check first:
-  0. repeated Idempotency-Key -> the original job is returned (no new work, no rate-limit token used)
   1. per-user rate limit      -> 429 + Retry-After   (this user is sending too much)
-  2. queue depth limit        -> 503 + Retry-After   (the system is full: load shedding)
-  3. conversation ownership   -> 404                 (needs the database)
+  2. daily token budget       -> 429 + Retry-After   (this user has used today's allowance)
+  3. queue depth limit        -> 503 + Retry-After   (the system is full: load shedding)
+  4. conversation ownership   -> 404                 (needs the database)
 """
 
 import json
@@ -25,6 +25,7 @@ from app.api.schemas.chat import ChatQueryRequest, ChatQueryResponse
 from app.config import get_settings
 from app.db.models import User
 from app.deps import get_current_user, get_db
+from app.scaling.budgets import UserTokenLedger
 from app.scaling.idempotency import IdempotencyStore, request_fingerprint
 from app.scaling.jobs import JobStore
 from app.scaling.rate_limit import RateLimiter
@@ -53,6 +54,10 @@ def get_rate_limiter() -> RateLimiter:
         capacity=settings.scaling_rate_limit_capacity,
         refill_per_second=settings.scaling_rate_limit_refill_per_second,
     )
+
+
+def get_token_ledger() -> UserTokenLedger:
+    return UserTokenLedger(get_redis(), get_settings().scaling_max_tokens_per_user_per_day)
 
 
 def get_max_queue_depth() -> int:
@@ -95,6 +100,7 @@ def submit_job(
     current_user: User = Depends(get_current_user),
     store: JobStore = Depends(get_job_store),
     limiter: RateLimiter = Depends(get_rate_limiter),
+    ledger: UserTokenLedger = Depends(get_token_ledger),
     max_queue_depth: int = Depends(get_max_queue_depth),
     idempotency: IdempotencyStore = Depends(get_idempotency_store),
     idempotency_key: str | None = Header(default=None, min_length=1, max_length=128),
@@ -116,6 +122,7 @@ def submit_job(
 
     try:
         limit = limiter.check(current_user.id)
+        daily_budget_used_up = ledger.is_exhausted(current_user.id)
         queue_depth = store.queue_depth()
     except RedisError:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Queue unavailable")
@@ -125,6 +132,16 @@ def submit_job(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Rate limit exceeded",
             headers={"Retry-After": str(max(1, math.ceil(limit.retry_after_seconds)))},
+        )
+
+    # Daily token budget: refuse early instead of queueing a job that would only
+    # fail in the worker. Tokens are counted as jobs run, so a user can slightly
+    # overshoot the limit with jobs that were already queued.
+    if daily_budget_used_up:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Daily usage limit reached. It resets at midnight UTC.",
+            headers={"Retry-After": str(ledger.seconds_until_reset())},
         )
 
     # Load shedding: when the queue is full, refuse new work instead of letting
@@ -185,10 +202,12 @@ def get_job(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
 
     result = ChatQueryResponse(**json.loads(job["result"])) if job["result"] else None
+    usage = json.loads(job["usage"]) if job.get("usage") else None
     return JobStatusResponse(
         job_id=job_id,
         status=job["status"],
         conversation_id=job["conversation_id"],
         result=result,
         error=job["error"] or None,
+        usage=usage or None,
     )

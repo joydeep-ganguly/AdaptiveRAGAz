@@ -48,6 +48,7 @@ class JobStore:
             "message": message,
             "result": "",
             "error": "",
+            "usage": "",
             "created_at": now,
             "updated_at": now,
         })
@@ -71,15 +72,15 @@ class JobStore:
     def mark_running(self, job_id: str) -> None:
         self._update(job_id, status=STATUS_RUNNING)
 
-    def mark_succeeded(self, job_id: str, result: dict) -> None:
-        self._update(job_id, status=STATUS_SUCCEEDED, result=json.dumps(result))
+    def mark_succeeded(self, job_id: str, result: dict, usage: dict | None = None) -> None:
+        self._update(job_id, status=STATUS_SUCCEEDED, result=json.dumps(result), usage=json.dumps(usage or {}))
         # Keep the finished result for the full TTL, counted from completion.
         self.client.expire(self._key(job_id), self.result_ttl_seconds)
 
-    def mark_failed(self, job_id: str, error: str) -> None:
-        self._update(job_id, status=STATUS_FAILED, error=error)
+    def mark_failed(self, job_id: str, error: str, usage: dict | None = None) -> None:
+        self._update(job_id, status=STATUS_FAILED, error=error, usage=json.dumps(usage or {}))
         self.client.expire(self._key(job_id), self.result_ttl_seconds)
-
+        
     def _update(self, job_id: str, **fields: str) -> None:
         fields["updated_at"] = str(time.time())
         self.client.hset(self._key(job_id), mapping=fields)

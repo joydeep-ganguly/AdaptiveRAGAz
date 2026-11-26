@@ -40,7 +40,7 @@ Show how the agent is scaled for many concurrent users, and keep the scaling par
 | 2 | Queue and worker (submit, queue, work, poll) | Done |
 | 3 | Per-user token-bucket rate limit (429 + `Retry-After`), bounded queue with load shedding | Done |
 | 4 | Idempotency keys; caches for embeddings and repeated LLM calls | Done |
-| 5 | Token budgets per request and per user; cap on the grade/rewrite loop | Not started |
+| 5 | Token budgets per request and per user; cap on the grade/rewrite loop | Done |
 | 6 | Retries with exponential backoff and jitter on model and search calls | Not started |
 | 7 | Observability: latency, queue depth, 429 rate, tokens per request | Not started |
 | 8 | Postgres support; `docker-compose.scale.yml` (API, Redis, workers, Postgres) | Not started |
@@ -98,6 +98,19 @@ Design notes for Step 4:
 - Hit and miss counts are kept in Redis (`cache_stats`) for the results table.
 - Expected hit pattern: an identical question in a new conversation hits on the early deterministic steps; the same question inside a long conversation usually misses because the history differs. State this honestly in the write-up.
 
+### Step 5 detail
+
+| Sub-step | What | Files | Status |
+|---|---|---|---|
+| 5a | Budget machinery: per-user daily token ledger in Redis, `TokenBudgetCallback` (checks before each model call, counts tokens after), `BudgetedGraph` wrapper; cached calls cost 0 tokens; 10 tests | `app/scaling/budgets.py`, `cache.py` (small edit), `tests/unit/test_scaling_budgets.py` | Done |
+| 5b | Wiring: worker applies per-request limits (tokens and model calls) and stores usage on the job; submit returns 429 + `Retry-After` when the user's daily budget is used up; rewrite loop capped by `SCALING_MAX_REWRITES_PER_REQUEST` in the scale profile; `usage` returned by `GET /chat/jobs/{id}`; 13 new tests (suite 373 passed); real check done (see results below) | `worker.py`, `router.py`, `jobs.py`, `schemas.py`, `config.py`, `rag_nodes.py`, tests | Done |
+
+Design notes for Step 5:
+- Three limits: tokens per request, model calls per request (stops runaway loops), tokens per user per UTC day. A request that crosses a limit has already made the call that crossed it, so it can overshoot by at most one call.
+- When a limit stops a job, the job ends as `failed` with a clear message and its usage; the client is not shown a generic error.
+- The plain profile keeps the original rewrite limit (`MAX_ITERATIONS = 3`); the scale profile uses `SCALING_MAX_REWRITES_PER_REQUEST`.
+- Limits of this design: only LangChain model calls are counted. The Foundry web-search agent tokens and embeddings are not counted. Daily limits reset at UTC midnight (05:30 IST), a simplification. The daily check on submit uses tokens already recorded, so jobs already in the queue can push a user slightly over. A budget-stopped job leaves the user's message saved without an assistant reply, like other failed jobs.
+
 ## 5. Local environment notes
 
 - Start local Redis: `docker run -d --name redis-adaptive -p 6379:6379 redis:7`
@@ -127,6 +140,18 @@ Same question asked in two new conversations: "What is Amazon's revenue for the 
 
 Both runs returned the same answer. This is the best case: an identical question, no earlier conversation history, within the cache lifetime (`SCALING_CACHE_TTL_SECONDS`, 1 hour by default). A question asked inside a long conversation usually misses, because the prompt includes the history. This was one user and one worker, not a load test.
 
+### Token usage and budget behaviour (real services, 26 Nov 2026)
+
+Question: "What is Amazon's revenue for the year 2023?" (document question, cache cleared first so every call is counted).
+
+| Run | Limit set | Outcome | Model calls | Tokens |
+|---|---|---|---|---|
+| A (measure) | 1,000,000 per request | Succeeded in 42.6 s | 7 | 17,999 |
+| B (per-question limit) | 1,000 per request | Failed in 6.3 s with "needed more processing than the per-question limit allows" | 3 | 1,175 |
+| C (daily limit) | 1,000 per user per day | Submit refused: 429, `Retry-After` 41428 s (seconds to UTC midnight); no job queued | 0 | counter stayed at 1,175 |
+
+A normal document question uses about 7 model calls and 18,000 tokens, mostly because prompts carry the retrieved passages. The per-request default is set to about 3x that (60,000 tokens); the per-call default of 20 is about 3x the 7 calls. These are single-question measurements, not an average over many questions.
+
 ## 7. Change log
 
 | Date | Change |
@@ -143,3 +168,5 @@ Both runs returned the same answer. This is the best case: an identical question
 | 24 Nov 2026 | Step 4 started (idempotency keys, then caches) |
 | 24 Nov 2026 | Step 4a done: `Idempotency-Key` on submit (replay returns the original job, no rate-limit token used; same key with a different request gets 422; key released if queueing fails); suite 335 passed |
 | 25 Nov 2026 | Step 4b done: Redis embedding cache and LLM-response cache (fail open, enabled only with `SCALING_ENABLED=true`); suite 350 passed; repeat of a document question went from 39.2 s to 0.6 s with 7/7 LLM and 1/1 embedding hits. Step 4 complete |
+| 26 Nov 2026 | Step 5a done: token ledger, budget callback and graph wrapper (cached calls cost 0 tokens); suite 360 passed |
+| 26 Nov 2026 | Step 5b done: per-request token and call limits in the worker, daily token budget with 429 on submit, rewrite cap in the scale profile, usage shown on the job; suite 373 passed. Real check: 7 calls and 17,999 tokens for a normal question; per-question and daily limits both enforced. Per-request default raised from 50,000 to 60,000 tokens. Step 5 complete |

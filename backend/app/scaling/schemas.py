@@ -16,3 +16,4 @@ class JobStatusResponse(BaseModel):
     conversation_id: str
     result: ChatQueryResponse | None = None  # filled in once status is "succeeded"
     error: str | None = None  # filled in once status is "failed"
+    usage: dict | None = None  # {"tokens": ..., "llm_calls": ...} once the job has finished (scale profile only)

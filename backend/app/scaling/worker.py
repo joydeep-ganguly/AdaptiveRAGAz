@@ -16,6 +16,7 @@ import signal
 from app.agent.graph import create_adaptive_rag
 from app.config import get_settings
 from app.db.session import SessionLocal
+from app.scaling.budgets import BudgetedGraph, BudgetExceeded, BudgetLimits, TokenBudgetCallback, UserTokenLedger
 from app.logging_config import setup_logging
 from app.scaling.jobs import JobStore
 from app.scaling.redis_client import get_redis
@@ -24,7 +25,7 @@ from app.services import chat_service
 logger = logging.getLogger(__name__)
 
 
-def process_job(store: JobStore, graph, job_id: str) -> None:
+def process_job(store: JobStore, graph, job_id: str, budget: BudgetLimits | None = None) -> None:
     job = store.get(job_id)
     if job is None:
         # The job record expired while the id was still waiting in the queue.
@@ -32,6 +33,21 @@ def process_job(store: JobStore, graph, job_id: str) -> None:
         return
 
     store.mark_running(job_id)
+
+    # With a budget, the graph is wrapped so every model call in this job is counted.
+    callback = None
+    if budget is not None:
+        callback = TokenBudgetCallback(
+            budget.ledger,
+            user_id=int(job["user_id"]),
+            max_tokens=budget.max_tokens,
+            max_llm_calls=budget.max_llm_calls,
+        )
+        graph = BudgetedGraph(graph, callback)
+
+    def usage_so_far() -> dict | None:
+        return callback.usage if callback else None
+
     db = SessionLocal()  # one database session per job, always closed afterwards
     try:
         assistant_message, media_filenames = chat_service.send_message(
@@ -46,14 +62,18 @@ def process_job(store: JobStore, graph, job_id: str) -> None:
             "role": assistant_message.role,
             "content": assistant_message.content,
             "media_filenames": media_filenames,
-        })
-        logger.info("Job %s succeeded", job_id)
+        }, usage=usage_so_far())
+        logger.info("Job %s succeeded (usage: %s)", job_id, usage_so_far())
     except chat_service.ConversationNotFoundError:
         store.mark_failed(job_id, "Conversation not found")
+    except BudgetExceeded as exc:
+        # A limit stopped the run. The client gets a clear reason, not a crash.
+        logger.warning("Job %s stopped by budget (%s); usage: %s", job_id, exc.reason, usage_so_far())
+        store.mark_failed(job_id, exc.user_message, usage=usage_so_far())
     except Exception:
         # Full details go to the log; the client only sees a generic message.
         logger.exception("Job %s failed", job_id)
-        store.mark_failed(job_id, "Internal error while processing the question")
+        store.mark_failed(job_id, "Internal error while processing the question", usage=usage_so_far())
     finally:
         db.close()
 
@@ -74,6 +94,11 @@ def run_worker() -> None:
 
     graph = create_adaptive_rag()  # built once per worker process, like the API does at startup
     store = JobStore(get_redis(), settings.scaling_job_result_ttl_seconds)
+    budget = BudgetLimits(
+        ledger=UserTokenLedger(get_redis(), settings.scaling_max_tokens_per_user_per_day),
+        max_tokens=settings.scaling_max_tokens_per_request,
+        max_llm_calls=settings.scaling_max_llm_calls_per_request,
+    )
 
     stop_requested = {"value": False}
 
@@ -89,7 +114,7 @@ def run_worker() -> None:
         job_id = store.pop(timeout_seconds=2)  # wakes every 2 s so it notices a stop request
         if job_id is None:
             continue
-        process_job(store, graph, job_id)
+        process_job(store, graph, job_id, budget)
     logger.info("Worker stopped")
 
 

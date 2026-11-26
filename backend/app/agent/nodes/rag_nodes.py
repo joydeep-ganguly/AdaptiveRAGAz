@@ -9,10 +9,17 @@ from app.agent.debug_utils import write_debug_log
 
 from app.agent.tools.doc_tools import retriever_docs, NO_DOCUMENTS_PREFIX
 from app.agent.llm import get_reasoning_llm
+from app.config import get_settings
 
 llm = get_reasoning_llm()
 
 MAX_ITERATIONS = 3
+
+
+def _max_iterations() -> int:
+    # Plain profile: the original limit. Scale profile: the configurable (tighter) cap.
+    settings = get_settings()
+    return settings.scaling_max_rewrites_per_request if settings.scaling_enabled else MAX_ITERATIONS
 
 
 # Fixed reply when nothing relevant was retrieved: the LLM is not called, so it cannot
@@ -277,7 +284,7 @@ def should_generate(state):
 
     iteration_count = state.get('rewritting_count',1)
 
-    if (not retrieved_docs or retrieved_docs.strip() == '') and iteration_count <= MAX_ITERATIONS:
+    if (not retrieved_docs or retrieved_docs.strip() == '') and iteration_count <= _max_iterations():
         print(f"[ROUTER] No relevant documents - transforming query")
         return 'transform_query'
     else:
@@ -293,7 +300,7 @@ def check_answer_quality(state):
     generation = state['messages'][-1].content
     iteration_count = state.get('rewritting_count',1)
 
-    if iteration_count > MAX_ITERATIONS:
+    if iteration_count > _max_iterations():
         print("[ROUTER] No relevant document and reached max iterations")
         return END
 

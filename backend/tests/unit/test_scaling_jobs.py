@@ -54,3 +54,13 @@ def test_mark_failed_stores_error(job_store):
 def test_job_has_an_expiry(job_store, fake_redis):
     job_id = job_store.enqueue(1, "conv-1", "hello")
     assert 0 < fake_redis.ttl(f"{JOB_KEY_PREFIX}{job_id}") <= 60
+
+
+def test_usage_is_stored_with_the_outcome(job_store):
+    ok = job_store.enqueue(1, "c1", "hello")
+    job_store.mark_succeeded(ok, {"content": "hi"}, usage={"tokens": 10, "llm_calls": 1})
+    bad = job_store.enqueue(1, "c1", "hello")
+    job_store.mark_failed(bad, "nope", usage={"tokens": 5, "llm_calls": 2})
+
+    assert json.loads(job_store.get(ok)["usage"]) == {"tokens": 10, "llm_calls": 1}
+    assert json.loads(job_store.get(bad)["usage"]) == {"tokens": 5, "llm_calls": 2}

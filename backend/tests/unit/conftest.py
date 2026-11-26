@@ -6,6 +6,7 @@ import pytest
 from app.scaling.idempotency import IdempotencyStore
 from app.scaling.jobs import JobStore
 from app.scaling.rate_limit import RateLimiter
+from app.scaling.budgets import UserTokenLedger
 
 
 @pytest.fixture()
@@ -29,3 +30,9 @@ def rate_limiter(fake_redis):
 @pytest.fixture()
 def idempotency_store(fake_redis):
     return IdempotencyStore(fake_redis, ttl_seconds=3600)
+
+
+@pytest.fixture()
+def token_ledger(fake_redis):
+    # Generous by default; tests about the daily budget build their own with a small limit.
+    return UserTokenLedger(fake_redis, daily_limit=1_000_000)
