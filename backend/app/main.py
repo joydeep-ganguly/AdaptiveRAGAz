@@ -38,6 +38,8 @@ app.include_router(media.router)
 # Scaling layer: mounted only when SCALING_ENABLED=true. The import sits inside
 # the if on purpose, so the small setup never loads the scaling package or needs Redis.
 if get_settings().scaling_enabled:
+    from app.scaling.metrics_router import router as metrics_router
     from app.scaling.router import router as scaling_router
 
     app.include_router(scaling_router)
+    app.include_router(metrics_router)
