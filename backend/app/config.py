@@ -125,6 +125,7 @@ class Settings(BaseSettings):
     scaling_max_tokens_per_user_per_day: int = 500000
     scaling_max_rewrites_per_request: int = 2
     scaling_max_llm_calls_per_request: int = 20  # a normal RAG question uses about 7
+    scaling_worker_metrics_port: int = 9100  # each worker serves /metrics here; 0 turns it off
 
     # Retries on model and search calls: exponential backoff with jitter
     scaling_retry_max_attempts: int = 4

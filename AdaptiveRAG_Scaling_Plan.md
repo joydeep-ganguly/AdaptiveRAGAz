@@ -42,7 +42,7 @@ Show how the agent is scaled for many concurrent users, and keep the scaling par
 | 4 | Idempotency keys; caches for embeddings and repeated LLM calls | Done |
 | 5 | Token budgets per request and per user; cap on the grade/rewrite loop | Done |
 | 6 | Retries with exponential backoff and jitter on model and search calls | Done |
-| 7 | Observability: latency, queue depth, 429 rate, tokens per request | Not started |
+| 7 | Observability: latency, queue depth, 429 rate, tokens per request | Done |
 | 8 | Postgres support; `docker-compose.scale.yml` (API, Redis, workers, Postgres) | Not started |
 | 9 | Load tests (stubbed LLM/search first, then a small real-services run); results table | Not started |
 | 10 | Architecture doc with diagram and "how this scales to 100,000 concurrent users" | Not started |
@@ -127,6 +127,37 @@ Design notes for Step 6:
 - Not tested with real failures: the Gemini chat retries and the Azure Search policy were checked in unit tests and by a normal end-to-end question, not by causing real outages. The embeddings wrapper was checked against the real embeddings model with simulated 503 errors.
 - Library versions checked: `langchain-google-genai` 4.4.0, `google-genai` 2.28.0, `azure-core` 1.41.0, `azure-search-documents` 12.1.0.
 
+### Step 7 detail
+
+| Sub-step | What | Files | Status |
+|---|---|---|---|
+| 7a | Metric definitions in the Prometheus text format; queue depth and cache hits/misses read from Redis at scrape time; `GET /metrics` on the API (scale profile only); 7 tests | `app/scaling/metrics.py`, `metrics_router.py`, `main.py`, `requirements/scaling.txt` | Done |
+| 7b | Submit outcomes counted in the submit endpoint; worker records queue wait, run time, tokens, model calls, jobs in progress and outcome, and serves its own `/metrics` on port 9100 (`SCALING_WORKER_METRICS_PORT`, 0 = off); 14 tests (suite 422 passed) | `router.py`, `worker.py`, `metrics.py`, `config.py`, tests | Done |
+
+Metrics (all names start with `adaptiverag_`):
+
+| Question | Metric |
+|---|---|
+| Is the queue backing up? | `queue_depth` (read from Redis at scrape time) |
+| How often are users refused? | `submit_requests_total{outcome}`; 429 rate = `rate_limited` + `budget_exhausted` over all submits |
+| How long do users wait, how long does a job run? | `job_queue_wait_seconds`, `job_duration_seconds` (histograms) |
+| What does a question cost? | `job_tokens`, `job_llm_calls` (histograms) |
+| Are the caches working? | `cache_requests_total{cache,outcome}` |
+| How busy is a worker? | `jobs_in_progress`, `jobs_total{outcome}` |
+
+Design notes for Step 7:
+- Each process serves its own event numbers (API: submit outcomes; worker: job timings and tokens); shared state (queue depth, cache stats) is read from Redis when the API is scraped. Prometheus scrapes the API on port 8000 and each worker on port 9100.
+- No label holds a user id, job id or question, so the number of time series stays small.
+- Metrics never break a request: if Redis is down the queue and cache numbers are skipped for that scrape.
+- Queue depth is also the signal the optional Container Apps/KEDA stage would scale workers on.
+
+Known limits of this design:
+- One API process per container. With several uvicorn processes in one container, each would report only its own counts (prometheus_client multiprocess mode is not set up). Scaling is by container replicas.
+- Queue wait is measured with the clock of the machine that submitted the job and the clock of the worker; on separate hosts, clock differences add error.
+- `/metrics` needs no login; keep it off the public internet.
+- Two workers on one machine cannot both use port 9100; the second logs a warning and runs without metrics. In containers each worker has its own network, so this does not arise.
+- Retry counts and Foundry web-search tokens are not exported.
+
 ## 5. Local environment notes
 
 - Start local Redis: `docker run -d --name redis-adaptive -p 6379:6379 redis:7`
@@ -179,6 +210,29 @@ First calls made to fail with a simulated 503; settings: 4 attempts, base 1.0 s,
 
 The waits are random each time (jitter), so a repeat run shows different numbers. After the retry layer was added, one normal document question still succeeded: 7 model calls, 21,640 tokens, 78.2 s (the earlier run took 42.6 s with 17,999 tokens; the answer text differs, and Gemini latency varies between runs, so this is not read as an effect of the retry layer).
 
+### Metrics check (real services, 27 Nov 2026)
+
+Phase 1, no worker running, burst of 15 submissions by one user (bucket capacity 10):
+
+| Metric | Value |
+|---|---|
+| `submit_requests_total{outcome="accepted"}` | 10 |
+| `submit_requests_total{outcome="rate_limited"}` | 5 (the burst script showed 429 with Retry-After 2 for requests 11 to 15) |
+| `queue_depth` | 10 (dropped to 0 after the queue was cleared) |
+
+Phase 2, worker running, one real document question (Amazon revenue 2023):
+
+| Metric (worker, port 9100) | Value |
+|---|---|
+| `jobs_total{outcome="succeeded"}` | 1 |
+| `job_queue_wait_seconds_sum` | 0.008 s (the worker was idle) |
+| `job_duration_seconds_sum` | 35.2 s |
+| `job_tokens_sum` | 23,912 |
+| `job_llm_calls_sum` | 7 |
+| `jobs_in_progress` | 0 after the job |
+
+The API side showed `accepted` rising from 10 to 11 and `queue_depth` back at 0. Tokens for the same question across three real runs: 17,999, 21,640 and 23,912, always 7 model calls, so the 60,000 default is still about 2.5x to 3.3x a normal question.
+
 ## 7. Change log
 
 | Date | Change |
@@ -198,3 +252,5 @@ The waits are random each time (jitter), so a repeat run shows different numbers
 | 26 Nov 2026 | Step 5a done: token ledger, budget callback and graph wrapper (cached calls cost 0 tokens); suite 360 passed |
 | 26 Nov 2026 | Step 5b done: per-request token and call limits in the worker, daily token budget with 429 on submit, rewrite cap in the scale profile, usage shown on the job; suite 373 passed. Real check: 7 calls and 17,999 tokens for a normal question; per-question and daily limits both enforced. Per-request default raised from 50,000 to 60,000 tokens. Step 5 complete |
 | 26 Nov 2026 | Step 6 done: retry layer for the scale profile (jittered backoff; embeddings wrapper; jittered Azure Search policy; Gemini attempt count from settings; Foundry web search deliberately not retried); suite 401 passed; embeddings retry checked against the real model with simulated 503 errors; a normal question still succeeds end to end |
+| 27 Nov 2026 | Step 7a done: `/metrics` on the API with queue depth and cache hits/misses read from Redis; suite 408 passed |
+| 27 Nov 2026 | Step 7b done: submit outcomes counted; worker records queue wait, duration, tokens, model calls, jobs in progress and outcome, and serves `/metrics` on port 9100; suite 422 passed; real check matches the unit tests (10 accepted and 5 rate-limited in a burst of 15; one real job: 23,912 tokens, 7 calls, 35.2 s). Step 7 complete |

@@ -74,3 +74,20 @@ def test_metrics_endpoint_serves_the_prometheus_text_format(fake_redis, job_stor
     assert response.headers["content-type"].startswith("text/plain")
     assert "adaptiverag_queue_depth 1.0" in response.text
     assert "# TYPE adaptiverag_job_duration_seconds histogram" in response.text
+
+
+def test_a_busy_worker_port_only_loses_metrics(monkeypatch):
+    def _busy(port):
+        raise OSError("address already in use")
+
+    monkeypatch.setattr(metrics, "start_http_server", _busy)
+
+    assert metrics.start_worker_metrics_server(9100) is False
+
+
+def test_worker_metrics_server_starts_on_the_given_port(monkeypatch):
+    started = []
+    monkeypatch.setattr(metrics, "start_http_server", started.append)
+
+    assert metrics.start_worker_metrics_server(9100) is True
+    assert started == [9100]

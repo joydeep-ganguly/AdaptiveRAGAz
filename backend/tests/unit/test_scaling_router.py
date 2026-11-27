@@ -3,6 +3,7 @@
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from prometheus_client import REGISTRY
 from redis.exceptions import ConnectionError as RedisConnectionError
 
 from app.config import get_settings
@@ -340,4 +341,90 @@ def test_get_job_has_no_usage_before_it_finishes(scaling_client, job_store, user
     job_id = job_store.enqueue(users.alice.id, "c1", "hello")
 
     assert scaling_client.get(f"/chat/jobs/{job_id}").json()["usage"] is None
+
+
+
+
+def _submits(outcome):
+    return REGISTRY.get_sample_value("adaptiverag_submit_requests_total", {"outcome": outcome})
+
+
+def test_accepted_submit_is_counted(scaling_client, db_session, users):
+    conversation = crud.create_conversation(db_session, user_id=users.alice.id)
+    before = _submits("accepted")
+
+    scaling_client.post(f"/chat/{conversation.id}/jobs", json={"message": "hello"})
+
+    assert _submits("accepted") == before + 1
+
+
+def test_rate_limited_submit_is_counted(scaling_client, db_session, users, fake_redis):
+    scaling_client.app.dependency_overrides[get_rate_limiter] = lambda: RateLimiter(
+        fake_redis, capacity=1, refill_per_second=0.5
+    )
+    url = f"/chat/{crud.create_conversation(db_session, user_id=users.alice.id).id}/jobs"
+    scaling_client.post(url, json={"message": "one"})
+    before = _submits("rate_limited")
+
+    scaling_client.post(url, json={"message": "two"})
+
+    assert _submits("rate_limited") == before + 1
+
+
+def test_budget_exhausted_submit_is_counted(scaling_client, db_session, users, fake_redis):
+    ledger = UserTokenLedger(fake_redis, daily_limit=100)
+    ledger.add(users.alice.id, 100)
+    scaling_client.app.dependency_overrides[get_token_ledger] = lambda: ledger
+    url = f"/chat/{crud.create_conversation(db_session, user_id=users.alice.id).id}/jobs"
+    before = _submits("budget_exhausted")
+
+    scaling_client.post(url, json={"message": "hello"})
+
+    assert _submits("budget_exhausted") == before + 1
+
+
+def test_shed_submit_is_counted(scaling_client, db_session, users):
+    scaling_client.app.dependency_overrides[get_max_queue_depth] = lambda: 1
+    url = f"/chat/{crud.create_conversation(db_session, user_id=users.alice.id).id}/jobs"
+    scaling_client.post(url, json={"message": "one"})
+    before = _submits("shed")
+
+    scaling_client.post(url, json={"message": "two"})
+
+    assert _submits("shed") == before + 1
+
+
+def test_not_found_submit_is_counted(scaling_client):
+    before = _submits("not_found")
+
+    scaling_client.post("/chat/does-not-exist/jobs", json={"message": "hello"})
+
+    assert _submits("not_found") == before + 1
+
+
+def test_replayed_and_conflicting_submits_are_counted(scaling_client, db_session, users):
+    url = f"/chat/{crud.create_conversation(db_session, user_id=users.alice.id).id}/jobs"
+    headers = {"Idempotency-Key": "abc-123"}
+    scaling_client.post(url, json={"message": "hello"}, headers=headers)
+    replayed, conflict = _submits("replayed"), _submits("conflict")
+
+    scaling_client.post(url, json={"message": "hello"}, headers=headers)
+    scaling_client.post(url, json={"message": "something else"}, headers=headers)
+
+    assert _submits("replayed") == replayed + 1
+    assert _submits("conflict") == conflict + 1
+
+
+def test_unavailable_queue_is_counted(scaling_client, db_session, job_store, users, monkeypatch):
+    url = f"/chat/{crud.create_conversation(db_session, user_id=users.alice.id).id}/jobs"
+
+    def _raise(*args, **kwargs):
+        raise RedisConnectionError("redis is down")
+
+    monkeypatch.setattr(job_store, "enqueue", _raise)
+    before = _submits("unavailable")
+
+    scaling_client.post(url, json={"message": "hello"})
+
+    assert _submits("unavailable") == before + 1
 

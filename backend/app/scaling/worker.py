@@ -12,6 +12,7 @@ synchronous endpoint uses), and store the outcome on the job.
 
 import logging
 import signal
+import time
 
 from app.agent.graph import create_adaptive_rag
 from app.config import get_settings
@@ -19,10 +20,27 @@ from app.db.session import SessionLocal
 from app.scaling.budgets import BudgetedGraph, BudgetExceeded, BudgetLimits, TokenBudgetCallback, UserTokenLedger
 from app.logging_config import setup_logging
 from app.scaling.jobs import JobStore
+from app.scaling.metrics import (
+    JOB_DURATION,
+    JOB_LLM_CALLS,
+    JOB_TOKENS,
+    JOBS,
+    JOBS_IN_PROGRESS,
+    QUEUE_WAIT,
+    start_worker_metrics_server,
+)
 from app.scaling.redis_client import get_redis
 from app.services import chat_service
 
 logger = logging.getLogger(__name__)
+
+
+def _record_job_metrics(outcome: str, seconds: float, usage: dict | None) -> None:
+    JOBS.labels(outcome=outcome).inc()
+    JOB_DURATION.observe(seconds)
+    if usage:
+        JOB_TOKENS.observe(usage["tokens"])
+        JOB_LLM_CALLS.observe(usage["llm_calls"])
 
 
 def process_job(store: JobStore, graph, job_id: str, budget: BudgetLimits | None = None) -> None:
@@ -33,6 +51,10 @@ def process_job(store: JobStore, graph, job_id: str, budget: BudgetLimits | None
         return
 
     store.mark_running(job_id)
+    started = time.monotonic()
+    QUEUE_WAIT.observe(max(0.0, time.time() - float(job["created_at"])))  # created_at was set at submit
+    JOBS_IN_PROGRESS.inc()
+    outcome = "failed"
 
     # With a budget, the graph is wrapped so every model call in this job is counted.
     callback = None
@@ -63,12 +85,14 @@ def process_job(store: JobStore, graph, job_id: str, budget: BudgetLimits | None
             "content": assistant_message.content,
             "media_filenames": media_filenames,
         }, usage=usage_so_far())
+        outcome = "succeeded"
         logger.info("Job %s succeeded (usage: %s)", job_id, usage_so_far())
     except chat_service.ConversationNotFoundError:
         store.mark_failed(job_id, "Conversation not found")
     except BudgetExceeded as exc:
         # A limit stopped the run. The client gets a clear reason, not a crash.
         logger.warning("Job %s stopped by budget (%s); usage: %s", job_id, exc.reason, usage_so_far())
+        outcome = "budget_stopped"
         store.mark_failed(job_id, exc.user_message, usage=usage_so_far())
     except Exception:
         # Full details go to the log; the client only sees a generic message.
@@ -76,7 +100,8 @@ def process_job(store: JobStore, graph, job_id: str, budget: BudgetLimits | None
         store.mark_failed(job_id, "Internal error while processing the question", usage=usage_so_far())
     finally:
         db.close()
-
+        JOBS_IN_PROGRESS.dec()
+        _record_job_metrics(outcome, time.monotonic() - started, usage_so_far())
 
 def run_worker() -> None:
     setup_logging()
@@ -92,6 +117,9 @@ def run_worker() -> None:
         logger.warning("SCALING_ENABLED is not true: LLM and embedding caches are off for this worker")
 
 
+    if settings.scaling_enabled and settings.scaling_worker_metrics_port:
+        start_worker_metrics_server(settings.scaling_worker_metrics_port)
+        
     graph = create_adaptive_rag()  # built once per worker process, like the API does at startup
     store = JobStore(get_redis(), settings.scaling_job_result_ttl_seconds)
     budget = BudgetLimits(

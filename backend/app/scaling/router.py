@@ -28,6 +28,7 @@ from app.deps import get_current_user, get_db
 from app.scaling.budgets import UserTokenLedger
 from app.scaling.idempotency import IdempotencyStore, request_fingerprint
 from app.scaling.jobs import JobStore
+from app.scaling.metrics import SUBMITS
 from app.scaling.rate_limit import RateLimiter
 from app.scaling.redis_client import get_redis
 from app.scaling.schemas import JobStatusResponse, JobSubmitResponse
@@ -76,6 +77,7 @@ def _replay_of_existing_job(
     the job is reported as "queued" (job_may_be_pending=True) rather than duplicated.
     """
     if entry.fingerprint != fingerprint:
+        SUBMITS.labels(outcome="conflict").inc()
         raise HTTPException(
             status_code=422,
             detail="Idempotency-Key was already used with a different request",
@@ -115,9 +117,11 @@ def submit_job(
             if existing is not None:
                 replay = _replay_of_existing_job(existing, fingerprint, store, response)
                 if replay is not None:
+                    SUBMITS.labels(outcome="replayed").inc()
                     return replay
                 idempotency.release(current_user.id, idempotency_key)  # original job expired: start fresh
         except RedisError:
+            SUBMITS.labels(outcome="unavailable").inc()
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Queue unavailable")
 
     try:
@@ -125,9 +129,11 @@ def submit_job(
         daily_budget_used_up = ledger.is_exhausted(current_user.id)
         queue_depth = store.queue_depth()
     except RedisError:
+        SUBMITS.labels(outcome="unavailable").inc()
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Queue unavailable")
 
     if not limit.allowed:
+        SUBMITS.labels(outcome="rate_limited").inc()
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Rate limit exceeded",
@@ -138,6 +144,7 @@ def submit_job(
     # fail in the worker. Tokens are counted as jobs run, so a user can slightly
     # overshoot the limit with jobs that were already queued.
     if daily_budget_used_up:
+        SUBMITS.labels(outcome="budget_exhausted").inc()
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Daily usage limit reached. It resets at midnight UTC.",
@@ -148,6 +155,7 @@ def submit_job(
     # it pile up. The check is approximate (a few extra jobs can slip in while
     # several requests race), which is fine for a safety valve.
     if queue_depth >= max_queue_depth:
+        SUBMITS.labels(outcome="shed").inc()
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Server busy, please try again shortly",
@@ -159,6 +167,7 @@ def submit_job(
     try:
         chat_service.get_owned_conversation(db, conversation_id, current_user.id)
     except chat_service.ConversationNotFoundError:
+        SUBMITS.labels(outcome="not_found").inc()
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
 
     job_id = str(uuid.uuid4())
@@ -169,13 +178,16 @@ def submit_job(
             # got here first (two simultaneous retries), return its job instead.
             existing = idempotency.claim(current_user.id, idempotency_key, job_id, fingerprint)
             if existing is not None:
+                SUBMITS.labels(outcome="replayed").inc()
                 return _replay_of_existing_job(existing, fingerprint, store, response, job_may_be_pending=True)
         except RedisError:
+            SUBMITS.labels(outcome="unavailable").inc()
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Queue unavailable")
 
     try:
         store.enqueue(current_user.id, conversation_id, payload.message, job_id=job_id)
     except RedisError:
+        SUBMITS.labels(outcome="unavailable").inc()
         if idempotency_key:
             try:
                 idempotency.release(current_user.id, idempotency_key)  # let the client's retry through
@@ -183,6 +195,7 @@ def submit_job(
                 pass
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Queue unavailable")
 
+    SUBMITS.labels(outcome="accepted").inc()
     return JobSubmitResponse(job_id=job_id, status="queued")
 
 

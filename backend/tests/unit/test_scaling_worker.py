@@ -1,7 +1,10 @@
 # backend/tests/unit/test_scaling_worker.py
 
 import json
+import time
 from types import SimpleNamespace
+
+from prometheus_client import REGISTRY
 
 from app.db import crud
 from app.scaling import worker
@@ -170,3 +173,75 @@ def test_process_job_skips_expired_job(job_store, fake_graph):
     worker.process_job(job_store, fake_graph, "no-such-job")  # must not raise
 
     assert fake_graph.invocations == []
+
+
+
+def _value(name, labels=None):
+    return REGISTRY.get_sample_value(name, labels or {}) or 0.0
+
+
+def test_successful_job_is_measured(db_session, job_store, fake_redis, monkeypatch):
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db_session)
+    user_id, conversation_id = _user_and_conversation(db_session, "alice")
+    job_id = job_store.enqueue(user_id, conversation_id, "hello")
+    done = _value("adaptiverag_jobs_total", {"outcome": "succeeded"})
+    runs = _value("adaptiverag_job_duration_seconds_count")
+    waits = _value("adaptiverag_job_queue_wait_seconds_count")
+    tokens = _value("adaptiverag_job_tokens_sum")
+    calls = _value("adaptiverag_job_llm_calls_sum")
+
+    worker.process_job(job_store, MeteredGraph(calls=3, tokens_per_call=100), job_id, _budget(fake_redis))
+
+    assert _value("adaptiverag_jobs_total", {"outcome": "succeeded"}) == done + 1
+    assert _value("adaptiverag_job_duration_seconds_count") == runs + 1
+    assert _value("adaptiverag_job_queue_wait_seconds_count") == waits + 1
+    assert _value("adaptiverag_job_tokens_sum") == tokens + 300
+    assert _value("adaptiverag_job_llm_calls_sum") == calls + 3
+
+
+def test_budget_stopped_job_is_counted_with_its_tokens(db_session, job_store, fake_redis, monkeypatch):
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db_session)
+    user_id, conversation_id = _user_and_conversation(db_session, "alice")
+    job_id = job_store.enqueue(user_id, conversation_id, "hello")
+    stopped = _value("adaptiverag_jobs_total", {"outcome": "budget_stopped"})
+    tokens = _value("adaptiverag_job_tokens_sum")
+
+    worker.process_job(job_store, MeteredGraph(calls=5, tokens_per_call=100), job_id, _budget(fake_redis, max_tokens=250))
+
+    assert _value("adaptiverag_jobs_total", {"outcome": "budget_stopped"}) == stopped + 1
+    assert _value("adaptiverag_job_tokens_sum") == tokens + 300
+
+
+def test_failed_job_is_counted_and_the_in_progress_gauge_returns_to_its_start(db_session, job_store, monkeypatch):
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db_session)
+    user_id, conversation_id = _user_and_conversation(db_session, "alice")
+    job_id = job_store.enqueue(user_id, conversation_id, "hello")
+    failed = _value("adaptiverag_jobs_total", {"outcome": "failed"})
+    in_progress = _value("adaptiverag_jobs_in_progress")
+    token_runs = _value("adaptiverag_job_tokens_count")
+
+    worker.process_job(job_store, ExplodingGraph(), job_id)  # no budget, so no token numbers
+
+    assert _value("adaptiverag_jobs_total", {"outcome": "failed"}) == failed + 1
+    assert _value("adaptiverag_jobs_in_progress") == in_progress
+    assert _value("adaptiverag_job_tokens_count") == token_runs
+
+
+def test_queue_wait_is_measured_from_the_time_of_submit(db_session, job_store, fake_graph, monkeypatch):
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db_session)
+    user_id, conversation_id = _user_and_conversation(db_session, "alice")
+    job_id = job_store.enqueue(user_id, conversation_id, "hello")
+    job_store.client.hset(f"adaptiverag:job:{job_id}", "created_at", str(time.time() - 5))
+    waited = _value("adaptiverag_job_queue_wait_seconds_sum")
+
+    worker.process_job(job_store, fake_graph, job_id)
+
+    assert _value("adaptiverag_job_queue_wait_seconds_sum") - waited >= 5
+
+
+def test_an_expired_job_records_nothing(job_store, fake_graph):
+    done = _value("adaptiverag_job_duration_seconds_count")
+
+    worker.process_job(job_store, fake_graph, "no-such-job")
+
+    assert _value("adaptiverag_job_duration_seconds_count") == done

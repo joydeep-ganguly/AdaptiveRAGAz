@@ -26,6 +26,7 @@ from prometheus_client import (
     Gauge,
     Histogram,
     generate_latest,
+    start_http_server,
 )
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 from redis.exceptions import RedisError
@@ -43,6 +44,7 @@ SUBMIT_OUTCOMES = (
     "budget_exhausted",   # 429, daily token budget used up
     "shed",               # 503, queue full
     "not_found",          # 404, conversation not found
+    "conflict",           # 422, Idempotency-Key reused with a different request
     "unavailable",        # 503, Redis not reachable
 )
 
@@ -128,3 +130,20 @@ def render_metrics(client) -> bytes:
 
 def metrics_content_type() -> str:
     return CONTENT_TYPE_LATEST
+
+
+
+
+def start_worker_metrics_server(port: int) -> bool:
+    """
+    Let a worker serve its own numbers (job timings, tokens) on its own port.
+    A worker has no web server of its own, so it starts a small one here. If the port
+    is taken, only this worker's metrics are lost; the worker keeps running.
+    """
+    try:
+        start_http_server(port)
+    except OSError:
+        logger.warning("Could not serve worker metrics on port %s; continuing without them", port)
+        return False
+    logger.info("Worker metrics on port %s (/metrics)", port)
+    return True
